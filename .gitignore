@@ -1,0 +1,29 @@
+# Credentials and data
+ctp_*.json
+结算单/
+快捷方式/
+*.json
+!README.md
+vnpy_engine.py
+diag.json
+l.json
+pos.json
+tree.json
+d.json
+_check.py
+data_snapshot_*.json
+desk*
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Logs and temp
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db

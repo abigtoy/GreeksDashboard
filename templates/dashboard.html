@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>期权监控看板</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', Arial, sans-serif; background: #0f1419; color: #e8e8e8; font-size: 13px; }
+
+.header { background: #1a2332; padding: 12px 20px; border-bottom: 1px solid #2a3a4a; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+.header h1 { color: #4a9eff; font-size: 16px; font-weight: 600; }
+.header .status { display: flex; gap: 20px; font-size: 12px; flex-wrap: wrap; }
+.header .status span { color: #8ba3b8; }
+.header .status .val { color: #e8e8e8; font-weight: 500; margin-left: 4px; }
+
+.summary-bar { display: flex; background: #1a2332; border-bottom: 1px solid #2a3a4a; }
+.summary-item { flex: 1; padding: 12px 16px; border-right: 1px solid #2a3a4a; }
+.summary-item:last-child { border-right: none; }
+.summary-item .label { color: #8ba3b8; font-size: 11px; margin-bottom: 4px; }
+.summary-item .value { font-size: 18px; font-weight: 600; }
+.delta { color: #4a9eff; }
+.gamma { color: #a78bfa; }
+.vega { color: #fb923c; }
+.theta { color: #f472b6; }
+.pnl { color: #4ade80; }
+.pnl.neg { color: #f87171; }
+
+table { width: 100%; border-collapse: collapse; }
+thead { position: sticky; top: 0; z-index: 10; }
+thead th { background: #1a2332; color: #8ba3b8; font-weight: 500; font-size: 11px; text-align: right; padding: 6px 8px; border-bottom: 1px solid #2a3a4a; white-space: nowrap; cursor: pointer; user-select: none; }
+thead th:hover { color: #e8e8e8; }
+thead th.sorted-asc::after { content: ' ▲'; color: #4a9eff; }
+thead th.sorted-desc::after { content: ' ▼'; color: #4a9eff; }
+thead th:first-child, thead th:nth-child(2) { text-align: left; }
+tbody tr { border-bottom: 1px solid #1a2332; }
+tbody tr:hover { background: #1a2535; }
+tbody td { text-align: right; padding: 6px 8px; font-size: 12px; white-space: nowrap; }
+tbody td:first-child, tbody td:nth-child(2) { text-align: left; }
+
+/* 折叠箭头 */
+.td-toggle { cursor: pointer; padding-left: 4px !important; width: 20px; }
+.toggle-arrow { color: #8ba3b8; font-size: 10px; transition: transform 0.15s; display: inline-block; }
+.toggle-arrow.expanded { transform: rotate(90deg); }
+
+/* 合约名分段显色 */
+.sym { font-weight: 600; }
+.sym-code { color: #4a9eff; }
+.sym-month { color: #93c5fd; }
+.sym-cp { font-weight: 700; }
+.sym-cp.call { color: #60a5fa; }
+.sym-cp.put { color: #c084fc; }
+.sym-strike { color: #8ba3b8; font-weight: 400; }
+
+/* ITM 高亮 */
+tr.itm { background: #1a2a3a; }
+tr.itm:hover { background: #1e3348; }
+tr.itm-short { background: #2a1a1a; }
+tr.itm-short:hover { background: #3a2222; }
+tr.collapsed { display: none; }
+
+/* 品种汇总行 */
+tr.group-row { background: #141d28; font-weight: 600; cursor: pointer; }
+tr.group-row td { color: #8ba3b8; font-size: 11px; }
+tr.group-row:hover { background: #1a2535; }
+.group-sym { color: #e8e8e8 !important; font-weight: 700; }
+
+/* 月份汇总行 */
+tr.month-row { background: #1a2535; cursor: pointer; }
+tr.month-row:hover { background: #1e2d40; }
+tr.month-row td { color: #8ba3b8; font-size: 11px; }
+tr.month-row.collapsed { display: none; }
+tr.pos-row.collapsed { display: none; }
+.month-sym { color: #e8e8e8 !important; font-weight: 600; padding-left: 20px !important; }
+
+/* 合计行 */
+tr.total-row { background: #12233d; font-weight: 700; border-top: 2px solid #2a3a5a; }
+tr.total-row td { color: #e8e8e8; font-size: 12px; }
+.total-label { color: #e8e8e8 !important; font-weight: 700; padding-left: 20px !important; }
+
+.dir.long { font-weight: 600; color: #4ade80; }
+.dir.short { font-weight: 600; color: #f87171; }
+.adj { color: #fbbf24; font-weight: 600; }
+.sub { color: #8ba3b8; font-size: 11px; }
+.call { color: #60a5fa; }
+.put { color: #c084fc; }
+
+.section-title { background: #141d28; padding: 6px 20px; font-size: 11px; color: #8ba3b8; border-bottom: 1px solid #2a3a4a; }
+.wrap { max-height: calc(100vh - 120px); overflow-y: auto; }
+.wrap::-webkit-scrollbar { width: 6px; }
+.wrap::-webkit-scrollbar-thumb { background: #2a3a4a; border-radius: 3px; }
+.loading { text-align: center; padding: 40px; color: #8ba3b8; }
+
+#settings-panel { background: #141d28; border-bottom: 1px solid #2a3a4a; display: none; }
+#settings-panel.open { display: block; }
+.settings-inner { padding: 16px 20px; }
+.settings-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 12px; }
+.settings-row:last-child { margin-bottom: 0; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { color: #8ba3b8; font-size: 11px; }
+.field input {
+  background: #0f1419; border: 1px solid #2a3a4a; color: #e8e8e8;
+  padding: 6px 10px; font-size: 12px; border-radius: 4px;
+  width: 160px; outline: none;
+}
+.field input:focus { border-color: #4a9eff; }
+.btn-row { display: flex; gap: 8px; align-items: center; }
+.btn {
+  padding: 7px 16px; font-size: 12px; border: none;
+  border-radius: 4px; cursor: pointer; font-weight: 600;
+}
+.btn-ctp { background: #dc2626; color: #fff; }
+.status-ok  { color: #4ade80; font-weight: 600; }
+.status-conn{ color: #fbbf24; font-weight: 600; }
+.status-err { color: #f87171; font-weight: 600; }
+.btn-ctp:hover { background: #b91c1c; }
+.btn-ctp.connected { background: #16a34a; }
+.btn-ctp.connected:hover { background: #15803d; }
+.btn-ctp.pending { background: #b45309; cursor: wait; }
+.btn-ctp:disabled { opacity: .7; cursor: not-allowed; }
+.hdr-account { display: flex; align-items: center; gap: 6px; }
+.hdr-account label { color: #8ba3b8; font-size: 11px; }
+.hdr-account select { background: #0f1419; border: 1px solid #2a3a4a; color: #e8e8e8; padding: 4px 8px; font-size: 12px; border-radius: 4px; width: 150px; outline: none; }
+.btn-toggle { background: #1a3a5c; color: #4a9eff; font-size: 11px; padding: 4px 10px; }
+.btn-toggle:hover { background: #1e4a72; }
+.msg { font-size: 11px; padding: 6px 10px; border-radius: 4px; margin-left: 8px; }
+.msg.ok { background: #14532d; color: #86efac; }
+.msg.err { background: #7f1d1d; color: #fca5a5; }
+.msg.info { background: #1e3a5c; color: #93c5fd; }
+
+/* 设置面板 Tabs */
+.settings-tabs { display: flex; gap: 0; border-bottom: 1px solid #2a3a4a; margin-bottom: 12px; }
+.settings-tab { padding: 8px 16px; color: #8ba3b8; font-size: 12px; cursor: pointer; border: none; background: none; border-bottom: 2px solid transparent; }
+.settings-tab.active { color: #4a9eff; border-bottom-color: #4a9eff; }
+.settings-tab:hover { color: #e8e8e8; }
+
+/* 列设置面板 */
+.col-config-panel { display: none; }
+.col-config-panel.active { display: block; }
+.col-config-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.col-config-item { display: flex; align-items: center; gap: 6px; background: #0f1419; border: 1px solid #2a3a4a; border-radius: 4px; padding: 6px 10px; }
+.col-config-item input[type="checkbox"] { width: 14px; height: 14px; accent-color: #4a9eff; }
+.col-config-item .col-name { flex: 1; color: #e8e8e8; font-size: 11px; min-width: 50px; }
+.col-config-item button { background: #141d28; border: 1px solid #2a3a4a; color: #e8e8e8; font-size: 12px; padding: 2px 8px; border-radius: 3px; cursor: pointer; }
+.col-config-item button:hover:not([disabled]) { background: #1a3050; }
+.col-config-item button[disabled] { opacity: 0.3; cursor: not-allowed; }
+.col-config-item input[type="text"] { background: #141d28; border: 1px solid #2a3a4a; color: #e8e8e8; font-size: 11px; padding: 2px 6px; border-radius: 3px; width: 70px; text-align: center; }
+.col-config-item input[type="text"]::placeholder { color: #4a5a6a; }
+.col-iv-note { font-size: 10px; color: #8ba3b8; padding: 6px 0 0 0; }
+
+/* 列隐藏（配置控制） */
+.col-hidden { display: none; }
+
+/* 断线重连弹窗 */
+#reconnect-modal {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 9999;
+  align-items: center;
+  justify-content: center;
+}
+#reconnect-modal.show { display: flex; }
+.modal-box {
+  background: #1a2332;
+  border: 1px solid #2a3a4a;
+  border-radius: 8px;
+  padding: 32px 40px;
+  max-width: 400px;
+  text-align: center;
+}
+.modal-box h3 { color: #f87171; font-size: 18px; margin-bottom: 12px; }
+.modal-box p { color: #8ba3b8; font-size: 13px; margin-bottom: 24px; }
+.modal-btns { display: flex; gap: 12px; justify-content: center; }
+.modal-btns .btn { padding: 8px 24px; font-size: 13px; }
+.btn-reconnect { background: #16a34a; color: #fff; }
+.btn-reconnect:hover { background: #15803d; }
+.btn-cancel-reconnect { background: #2a3a4a; color: #8ba3b8; }
+.btn-cancel-reconnect:hover { background: #374151; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>📊 期权持仓监控</h1>
+  <div class="status">
+    <span>CTP连接: <span class="val" id="ctp-status">-</span></span>
+    <span>持仓: <span class="val" id="cnt">0</span> 条</span>
+    <span>更新时间: <span class="val" id="lastUpdate">-</span></span>
+    <span>服务已运行: <span class="val" id="uptime">0:00:00</span></span>
+  </div>
+  <button type="button" class="btn btn-toggle" id="btn-collapse">− 折叠</button>
+  <button type="button" class="btn btn-toggle" id="btn-expand">+ 展开</button>
+  <div style="display:flex;align-items:center;gap:6px;">
+    <input type="text" id="f-undersearch" placeholder="品种筛选" value="" autocomplete="off" oninput="doFilterByUnder(this.value)"
+           style="background:#0f1419;border:1px solid #2a3a4a;color:#e8e8e8;padding:4px 10px;font-size:12px;border-radius:4px;width:120px;outline:none;">
+  </div>
+  <div class="hdr-account">
+    <label>账号</label>
+    <select id="account-select" onchange="onAccountSelect(this.value)"></select>
+  </div>
+  <button type="button" class="btn btn-ctp" id="btn-ctp" onclick="onCtpBtnClick()">● 连接CTP</button>
+  <button type="button" class="btn btn-toggle" id="btn-settings">⚙ 看板设置</button>
+</div>
+
+<div id="settings-panel">
+  <div class="settings-inner">
+    <div class="settings-tabs">
+      <button class="settings-tab active" onclick="switchSettingsTab('ctp')">CTP连接</button>
+      <button class="settings-tab" onclick="switchSettingsTab('cols')">列设置</button>
+      <button class="settings-tab" onclick="switchSettingsTab('fmt')">数据格式</button>
+      <button class="settings-tab" onclick="openSnapshotPanel()">📋 历史快照</button>
+    </div>
+
+    <!-- CTP 连接面板 -->
+    <div id="tab-ctp" class="tab-content active">
+    <div class="settings-row">
+      <div class="field"><label>用户名</label><input type="text" id="f-user" placeholder="如: 101009" value=""></div>
+      <div class="field"><label>密码</label><input type="password" id="f-pass" placeholder="密码" value="" autocomplete="new-password"></div>
+      <div class="field"><label>经纪商代码</label><input type="text" id="f-broker" placeholder="如: 009140" value=""></div>
+      <div class="field"><label>交易服务器</label><input type="text" id="f-td" placeholder="如: 101.230.202.69:41133" value=""></div>
+      <div class="field"><label>行情服务器</label><input type="text" id="f-md" placeholder="如: 101.230.202.69:42233" value=""></div>
+      <div class="field"><label>产品名称</label><input type="text" id="f-product" placeholder="如: client_vnpyhhs_2.0" value=""></div>
+      <div class="field"><label>授权编码</label><input type="text" id="f-auth" placeholder="授权码" value=""></div>
+      <div class="btn-row">
+        <span class="msg" id="conn-msg"></span>
+      </div>
+    </div>
+    </div>
+
+    <!-- 列显示/顺序配置 -->
+    <div id="tab-cols" class="tab-content" style="display:none;">
+      <div class="col-config-grid" id="col-config-list"></div>
+    </div>
+
+    <!-- 数据格式配置 -->
+    <div id="tab-fmt" class="tab-content" style="display:none;">
+      <div class="col-config-grid" id="fmt-config-list"></div>
+      <div class="col-iv-note">IV 列固定显示为百分比格式，无需配置</div>
+    </div>
+  </div>
+</div>
+
+<div class="summary-bar">
+  <div class="summary-item"><div class="label">ΔCash</div><div class="value delta" id="sumDC">-</div></div>
+  <div class="summary-item"><div class="label">ΓCash</div><div class="value gamma" id="sumGC">-</div></div>
+  <div class="summary-item"><div class="label">VegaCash</div><div class="value vega" id="sumVC">-</div></div>
+  <div class="summary-item"><div class="label">ΘCash</div><div class="value theta" id="sumTC">-</div></div>
+  <div class="summary-item"><div class="label">当日盈亏</div><div class="value pnl" id="sumPnlT">-</div></div>
+  <div class="summary-item"><div class="label">浮动盈亏</div><div class="value pnl" id="sumPnlH">-</div></div>
+  <div class="summary-item"><div class="label">持仓数</div><div class="value" id="posCount">-</div></div>
+</div>
+
+<div id="snapshot-panel" style="display:none; background:#141d28; border-bottom:1px solid #2a3a4a;">
+  <div style="padding:10px 20px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+    <span style="color:#8ba3b8; font-size:11px;">历史快照:</span>
+    <div id="snap-n" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
+    <div style="color:#2a3a4a;">|</div>
+    <div id="snap-a" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
+    <div style="color:#2a3a4a;">|</div>
+    <div id="snap-p" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
+  </div>
+</div>
+<div id="snapshot-viewer" style="display:none; background:#0f1a24; border-bottom:1px solid #2a3a4a; max-height:300px; overflow-y:auto;">
+  <div style="padding:8px 20px; display:flex; justify-content:space-between; align-items:center;">
+    <span id="snap-title" style="color:#4a9eff; font-size:12px;"></span>
+    <button onclick="closeSnapshot()" style="background:#1a3a5c; color:#4a9eff; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:11px;">关闭</button>
+  </div>
+  <div id="snap-table-wrap" style="padding:0 20px 10px;"></div>
+</div>
+
+<!-- 数据源切换banner -->
+<div id="mode-banner" style="display:none; background:#1a2a3a; border-bottom:2px solid #4a9eff; padding:8px 20px; display:flex; align-items:center; gap:12px;">
+  <span style="color:#4a9eff; font-size:12px;">📋 当前显示: <span id="mode-banner-text"></span></span>
+  <button onclick="returnToLive()" style="background:#1a3a5c; color:#4a9eff; border:none; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:11px;">← 返回实时</button>
+</div>
+
+<div class="wrap">
+  <div class="section-title">持仓明细</div>
+  <table>
+    <thead id="thead">
+      <tr id="headRow"></tr>
+    </thead>
+    <tbody id="positionBody">
+      <tr><td colspan="20" class="loading">暂无持仓数据，请先连接CTP</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div id="reconnect-modal">
+  <div class="modal-box">
+    <h3>⚠ CTP 已断开</h3>
+    <p>网络连接已中断，是否尝试重新连接？</p>
+    <div class="modal-btns">
+      <button class="btn btn-reconnect" onclick="doReconnectFromModal()">重连</button>
+      <button class="btn btn-cancel-reconnect" onclick="closeReconnectModal()">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/dashboard11.js"></script>
+</body>
+</html>
