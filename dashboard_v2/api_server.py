@@ -60,7 +60,7 @@ _shared_state = {
         {"col": "adjust_price",     "label": "调整价",    "visible": True,  "fmt": "0.0000"},
         {"col": "open_price",       "label": "开仓价",    "visible": True,  "fmt": "0.00"},
         {"col": "underlying_price", "label": "标的价",    "visible": False, "fmt": "0.00"},
-        {"col": "iv",               "label": "IV%",       "visible": True,  "fmt": "0.00%"},
+        {"col": "iv",               "label": "IV%",       "visible": True,  "fmt": "0.00"},
         {"col": "delta",            "label": "Δ",         "visible": True, "fmt": "0.0000"},
         {"col": "gamma",            "label": "Γ",         "visible": True, "fmt": "0.000000"},
         {"col": "vega",             "label": "Vega",      "visible": True, "fmt": "0.0000"},
@@ -308,10 +308,12 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
     raw_positions = engine.query_positions()
     logger.info(f"[_poll_once] query_positions() 返回 {len(raw_positions)} 条持仓")
 
-    # 按 vt_symbol 分组，过滤无效
-    # vnpy PositionData 无 available 字段（可用 = volume - frozen）；
-    # 且必须用副本累加，直接改 engine 缓存的对象会每轮轮询重复叠加
-    by_symbol = {}
+    # ── 订阅行情 + 收集标的 ───────────────────────────────────────────────────
+    all_option_ticks = []
+    futures_positions = []
+    underlying_set = set()
+    by_underlying = defaultdict(list)
+
     for pos in raw_positions:
         vt = pos.vt_symbol
         avail = pos.volume - pos.frozen
@@ -320,7 +322,6 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
             pos.available = avail
             by_symbol[vt] = pos
         else:
-            # 合并同一合约多笔持仓
             existing = by_symbol[vt]
             if pos.direction == Direction.LONG:
                 existing.volume += pos.volume
@@ -330,12 +331,7 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
                 existing.available -= avail
 
     positions = list(by_symbol.values())
-
-    # ── 订阅行情 + 收集标的 ───────────────────────────────────────────────────
-    all_option_ticks = []
-    futures_positions = []
-    _underlying_set = set()
-    by_underlying = defaultdict(list)
+    logger.info(f"[_poll_once] 分组后 positions={len(positions)}")
 
     for pos in positions:
         contract = engine.get_contract(pos.vt_symbol)
@@ -360,9 +356,9 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
         else:
             mapped_und = und
         full_und = f"{mapped_und}.{und_exchange}"
-        _underlying_set.add(full_und)
+        underlying_set.add(full_und)
 
-    for full_und in _underlying_set:
+    for full_und in underlying_set:
         engine.query_tick(full_und, timeout=None)
 
     # ── 收集标的行情 ─────────────────────────────────────────────────────────
@@ -564,6 +560,8 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
             "adjust_price":     td.get("adjust_price"),
         }
 
+    logger.info(f"[_poll_once] futures_positions={len(futures_positions)}, by_underlying={len(by_underlying)}, option_contracts={sum(len(v) for v in by_underlying.values())}")
+
     # ── 构造 contracts（格式对齐 build_tree 期望，统一 days_to_expiry）──────────
     contracts = {}
     for pos, contract in futures_positions:
@@ -593,7 +591,7 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
     # ── 写共享状态 ────────────────────────────────────────────────────────────
     # build_tree 是纯函数，需要 ticks + contracts + settlement_dict
     tree = build_tree(positions_out, ticks, contracts, settlement_cost_dict)
-
+    logger.info(f"[_poll_once] positions_out={len(positions_out)}, contracts={len(contracts)}, tree_nodes={len(tree.get('tree',[]))}")
     with _shared_lock:
         _shared_state["positions"] = positions_out
         _shared_state["underlying_prices"] = underlying_prices

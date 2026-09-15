@@ -17,6 +17,7 @@ const State = {
   snapshot:    null,            // 最新快照
   expandedG:   new Set(),       // 展开的 L1 key
   expandedM:   new Set(),       // 展开的 L2 key
+  __initial:   true,            // 首次加载标记（auto-expand 只在首次生效）
   sortCol:     'pnl_history',   // 当前排序列
   sortAsc:     false,           // 升序?
   filterTxt:   '',              // 品种筛选
@@ -35,22 +36,22 @@ let COL_DEF = [
   // 备用默认定义（API 未返回时使用）
   { col: 'symbol',           label: '合约',      fmt: null },
   { col: 'volume',           label: '数量',      fmt: '0'     },
-  { col: 'underlying_price', label: '标的价',    fmt: '0.00'  },
-  { col: 'last_price',       label: '最新价',    fmt: '0.00'  },
-  { col: 'adjust_price',     label: '调整价',    fmt: '0.0000'},
-  { col: 'open_price',       label: '开仓价',    fmt: '0.0000'},
-  { col: 'iv',               label: 'IV%',       fmt: '0.00%' },
-  { col: 'delta',            label: 'Δ',         fmt: '0.0000'},
-  { col: 'gamma',            label: 'Γ',         fmt: '0.000000'},
-  { col: 'vega',             label: 'Vega',      fmt: '0.0000'},
-  { col: 'deltacash',        label: 'ΔCash',     fmt: '0'     },
-  { col: 'gammacash',        label: 'ΓCash',     fmt: '0'     },
-  { col: 'vegacash',         label: 'VegaCash',  fmt: '0'     },
-  { col: 'thetacash',        label: 'ΘCash',     fmt: '0'     },
-  { col: 'days_to_expiry',   label: '剩余天',    fmt: '0'     },
-  { col: 'pnl_daily',        label: '盯日盈亏',  fmt: '0'     },
-  { col: 'pnl_today',        label: '当日盈亏',  fmt: '0'     },
-  { col: 'pnl_history',      label: '浮动盈亏',  fmt: '0'     },
+  { col: 'underlying_price', label: '标的价',    fmt: '0.00',  align: 'R' },
+  { col: 'last_price',       label: '最新价',    fmt: '0.00',  align: 'R' },
+  { col: 'adjust_price',     label: '调整价',    fmt: '0.0000',align: 'R' },
+  { col: 'open_price',       label: '开仓价',    fmt: '0.0000',align: 'R' },
+  { col: 'iv',               label: 'IV%',       fmt: '0.00',  pct: true, align: 'R' },
+  { col: 'delta',            label: 'Δ',         fmt: '0.0000',align: 'R' },
+  { col: 'gamma',            label: 'Γ',         fmt: '0.000000',align:'R' },
+  { col: 'vega',             label: 'Vega',      fmt: '0.0000',align: 'R' },
+  { col: 'deltacash',        label: 'ΔCash',     fmt: '0',     align: 'R' },
+  { col: 'gammacash',        label: 'ΓCash',     fmt: '0',     align: 'R' },
+  { col: 'vegacash',         label: 'VegaCash',  fmt: '0',     align: 'R' },
+  { col: 'thetacash',        label: 'ΘCash',     fmt: '0',     align: 'R' },
+  { col: 'days_to_expiry',   label: '剩余天',    fmt: '0',     align: 'R' },
+  { col: 'pnl_daily',        label: '盯日盈亏',  fmt: '0',     align: 'R' },
+  { col: 'pnl_today',        label: '当日盈亏',  fmt: '0',     align: 'R' },
+  { col: 'pnl_history',      label: '浮动盈亏',  fmt: '0',     align: 'R' },
 ];
 
 // 异步加载列配置：优先 localStorage（需完整18列），其次 API
@@ -93,7 +94,7 @@ function renderHead() {
   if (!tr) return;
   const visible = COL_DEF.filter(c => c.visible !== false && c.col !== 'symbol');
   tr.innerHTML = '<th data-sort-col="tree">合约</th>' + visible.map(c => {
-    const align = 'right';
+    const align = c.align === 'L' ? 'left' : 'right';
     return `<th data-sort-col="${c.col}" style="text-align:${align}">${c.label}</th>`;
   }).join('');
   tr.querySelectorAll('[data-sort-col]').forEach(el =>
@@ -114,12 +115,12 @@ function updateHeadSortCls() {
 //   dec 参数（legacy）: fmt(v, 2) → 固定小数位
 //   fmt 掩码（新）:      fmt(v, null, '0.00%') → 自定义格式
 // 掩码规则：'0.00' = 千分位+两位小数，'0.00%' = 百分比，'0' = 整数千分位
-function fmt(v, dec, mask) {
+function fmt(v, dec, mask, pct) {
   if (v === null || v === undefined) return '-';
   const n = parseFloat(v);
   if (isNaN(n)) return '-';
   if (mask !== undefined && mask !== null && mask !== '') {
-    return _fmtMask(n, mask);
+    return _fmtMask(n, mask, pct);
   }
   if (dec === null || dec === undefined) return n;
   const s = n.toFixed(dec);
@@ -128,31 +129,26 @@ function fmt(v, dec, mask) {
   return parts.join('.');
 }
 
-function _fmtMask(n, mask) {
-  // 处理百分号
-  const isPct = mask.endsWith('%');
-  const base = isPct ? mask.slice(0, -1) : mask;
+function _fmtMask(n, mask, pct) {
+  // pct=true: 原始值就是百分比（如 IV=36.26），只加%后缀不×100
+  // mask 以 % 结尾: 原始值是小数（如 0.3626），需×100再加%
+  const isPctFromMask = mask.endsWith('%');
+  const isPct = pct || isPctFromMask;
+  const base = isPctFromMask ? mask.slice(0, -1) : mask;
   // 判断是否有小数位（.后有多少个0/9）
   const m = base.match(/^([^.]*)(\.(0+|#+))?$/);
   if (!m) return String(n);
-  const intPart = m[1] || '';         // 整数部分格式 如 '0' 或 '#,##0'
+  const intPart = m[1] || '';
   // mask 整数部分必须为数字，否则无效
   if (!/^\d*$/.test(intPart)) return String(n);
-  const fracPart = m[3] ? m[3] : '';  // 小数部分 如 '.00' 或 '.0000'
+  const fracPart = m[3] ? m[3] : '';
   // 计算小数位数
   const dec = fracPart.length > 0 ? fracPart.length : (isPct ? 2 : 0);
   let sign = '';
   if (n < 0) { sign = '-'; n = Math.abs(n); }
-  // 整数部分千分位
-  const int = Math.floor(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  // 小数部分
-  let frac = '';
-  if (dec > 0) {
-    frac = (n - Math.floor(n)).toFixed(dec).split('.')[1];
-  }
-  // 组合
-  let result = (isPct ? (n * 100).toFixed(dec) : n.toFixed(dec));
-  // 千分位 + 百分号后缀
+  // pct=true 且 mask 以 % 结尾 → 原始值是小数(如 0.3626)，需×100
+  // pct=true 但 mask 无 % 后缀 → 原始值已是百分比(如 36.26)，不需×100，直接显示
+  let result = (isPct && isPctFromMask ? (n * 100).toFixed(dec) : n.toFixed(dec));
   const parts = result.split('.');
   parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   return sign + parts.join('.') + (isPct ? '%' : '');
@@ -310,12 +306,14 @@ async function fetchDashboard() {
     State.serverUptime = State.snapshot.uptime_seconds || 0;
     State.uptimeAt = Date.now();
 
-    // 初始展开（三层全展开，与 loadSnapshot 行为一致）
-    State.expandedG.clear(); State.expandedM.clear();
-    (State.snapshot.tree || []).forEach(l1 => {
-      State.expandedG.add(l1.key);
-      (l1.children || []).forEach(l2 => State.expandedM.add(l2.key));
-    });
+    // 首次加载：三层全展开；之后保持用户手动状态不变
+    if (State.__initial) {
+      State.__initial = false;
+      (State.snapshot.tree || []).forEach(l1 => {
+        State.expandedG.add(l1.key);
+        (l1.children || []).forEach(l2 => State.expandedM.add(l2.key));
+      });
+    }
 
     render();
     updateHeader();
@@ -387,46 +385,69 @@ function render() {
 function filterTree(tree, txt) {
   if (!txt || !txt.trim()) return tree;
   const q = txt.trim().toLowerCase();
+  // 返回 [l1, l2, l3] 全部匹配的节点
+  const match = (node) =>
+    (node.key && node.key.toLowerCase().includes(q)) ||
+    (node.name && node.name.toLowerCase().includes(q)) ||
+    (node.symbol && node.symbol.toLowerCase().includes(q));
+
   return tree
     .map(l1 => {
-      const l1match = l1.key.toLowerCase().includes(q) || (l1.name||'').toLowerCase().includes(q);
+      // L1 匹配 → 全子树
+      if (match(l1)) return { ...l1, children: l1.children || [] };
+      // L2/L3 匹配 → 截取匹配子树
       const l1children = (l1.children || [])
-        .map(l2 => ({
-          ...l2,
-          children: (l2.children || []).filter(l3 =>
-            l3.symbol && l3.symbol.toLowerCase().includes(q)
-          ),
-        }))
-        .filter(l2 => l2.children && l2.children.length > 0);
-      return { ...l1, children: l1children };
+        .map(l2 => {
+          if (match(l2)) return { ...l2, children: l2.children || [] };
+          const l2children = (l2.children || []).filter(l3 => match(l3));
+          return l2children.length > 0 ? { ...l2, children: l2children } : null;
+        })
+        .filter(Boolean);
+      return l1children.length > 0 ? { ...l1, children: l1children } : null;
     })
-    .filter(l1 => (l1.children && l1.children.length > 0) || l1match);
+    .filter(Boolean);
 }
 
 // ─── 前端内存排序 ─────────────────────────────────────────────────────────────
 function sortTree(tree, col, asc) {
   const dir = asc ? 1 : -1;
-  return [...tree].map(l1 => ({
+
+  const getVal = (node) => {
+    if (node.type === 'L3_CONTRACT' || node.symbol) {
+      // L3 / 合约节点：直接字段
+      return node[col] ?? 0;
+    } else if (node.metrics) {
+      // L1/L2 聚合节点：从 metrics 取
+      return node.metrics[col] ?? 0;
+    }
+    return 0;
+  };
+
+  const sorted = [...tree].map(l1 => ({
     ...l1,
-    children: [...(l1.children || [])]
-      .map(l2 => ({
-        ...l2,
-        children: [...(l2.children || [])].sort((a, b) => {
-          const va = a[col] ?? 0;
-          const vb = b[col] ?? 0;
-          if (typeof va === 'string') return dir * va.localeCompare(vb);
-          return dir * ((va * 1) - (vb * 1));
-        }),
-      }))
-      .sort((a, b) => {
-        const ma = a.metrics || {};
-        const mb = b.metrics || {};
-        const va = ma[col] ?? 0;
-        const vb = mb[col] ?? 0;
+    children: [...(l1.children || [])].map(l2 => ({
+      ...l2,
+      children: [...(l2.children || [])].sort((a, b) => {
+        const va = getVal(a);
+        const vb = getVal(b);
         if (typeof va === 'string') return dir * va.localeCompare(vb);
         return dir * ((va * 1) - (vb * 1));
       }),
+    })).sort((a, b) => {
+      const va = getVal(a);
+      const vb = getVal(b);
+      if (typeof va === 'string') return dir * va.localeCompare(vb);
+      return dir * ((va * 1) - (vb * 1));
+    }),
   }));
+
+  // L1 排序（不跨分支，不打散 children）
+  return sorted.sort((a, b) => {
+    const va = getVal(a);
+    const vb = getVal(b);
+    if (typeof va === 'string') return dir * va.localeCompare(vb);
+    return dir * ((va * 1) - (vb * 1));
+  });
 }
 
 // ─── Summary 区 ───────────────────────────────────────────────────────────────
@@ -444,6 +465,7 @@ function renderSummary(s) {
   set('sumPnlT',  s.total_pnl_today,   0);
   set('sumPnlH',  s.total_pnl_history, 0);
   set('posCount', s.position_count,     0);
+  set('cnt',      s.position_count,     0);
 
   // Summary 行颜色
   const pnlH = parseFloat(s.total_pnl_history) || 0;
@@ -457,25 +479,41 @@ function renderSummary(s) {
 // ─── 构建 L1/L2 汇总行（列布局由 COL_DEF 驱动，与表头/L3 严格对齐）───────────
 function buildAggRow(node, level, expSelf, collapsed, action) {
   const tr = document.createElement('tr');
-  tr.className = 'l' + level + '-row' + (collapsed ? ' collapsed' : '');
+  // type: L1_PRODUCT → group-row, L2_MONTH → month-row, L3_LEG → pos-row
+  const clsMap = { L1_PRODUCT: 'group-row', L2_MONTH: 'month-row', L3_LEG: 'pos-row' };
+  const rowCls = clsMap[node.type] || 'group-row';
+  tr.className = rowCls + (collapsed ? ' collapsed' : '');
   const m = node.metrics || {};
   const ico = expSelf ? '▼' : '▶';
   // symbol 列作为树控件格，其余列按 visible 过滤
   const dataCols = COL_DEF.filter(c => c.visible !== false && c.col !== 'symbol');
   const tds = dataCols.map(c => {
     if (c.col === 'symbol') return '';  // 不应出现
+    // L1_PRODUCT 品种行不显示 volume（子节点汇总，无参考意义）
+    if (node.type === 'L1_PRODUCT' && c.col === 'volume') return '<td></td>';
     if (Object.prototype.hasOwnProperty.call(m, c.col)) {
       const v = m[c.col];
       const tag = c.col === 'deltacash' ? cls(tagDC(v))
                 : c.col === 'gammacash' ? cls(tagGC(v))
                 : c.col.indexOf('pnl') === 0 ? pnlCls(v) : '';
-      return `<td class="num ${tag}">${fmt(v, null, c.fmt)}</td>`;
+      const defAlign = isNumCol(c.col) ? 'right' : 'left';
+      const align = c.align ? `text-align:${c.align==='R'?'right':'left'};` : `text-align:${defAlign};`;
+      return `<td class="num ${tag}" style="${align}">${fmt(v, null, c.fmt, c.pct)}</td>`;
     }
     return '<td></td>';
   });
   tr.innerHTML = `<td class="tree-cell"><span class="toggle" data-action="${action}" data-key="${node.key}">${ico}</span> <span class="l${level}-name">${node.name || node.key}</span></td>` + tds.join('');
-  tr.querySelector('[data-action]').addEventListener('click',
-    () => action === 'toggleG' ? toggleG(node.key) : toggleM(node.key));
+  // 行头点击 → 折叠/展开
+  const toggleFn = action === 'toggleG'
+    ? () => toggleG(node.key)
+    : () => toggleM(node.key);
+  tr.querySelector('[data-action]').addEventListener('click', e => { e.stopPropagation(); toggleFn(); });
+  tr.addEventListener('click', toggleFn);
+  // L1 字体加粗
+  if (level === 1) {
+    const nameSpan = tr.querySelector('.l1-name');
+    if (nameSpan) nameSpan.style.fontWeight = '700';
+  }
   return tr;
 }
 
@@ -490,12 +528,12 @@ function buildL2Row(l2, l1Key, l1Exp) {
 // ─── 构建 L3 明细行（td 顺序与 COL_DEF 一致 = 与表头对齐）──────────────────────
 function buildL3Row(l3, l2Key) {
   const tr = document.createElement('tr');
-  tr.className = 'l3-row';
+  tr.className = 'pos-row l3-indent';
   tr.dataset.key = l3.key;
 
   const visible = COL_DEF.filter(c => c.visible !== false);
-  // 首列空（树控件列），然后是可见列
-  let html = '<td class="tree-cell"></td>';
+  // L3 合约名（symbol）显示在树控件格，带缩进
+  let html = `<td class="tree-cell"><span class="l3-sym">${l3.name || l3.symbol}</span></td>`;
 
   for (const c of visible) {
     if (c.col === 'symbol') {
@@ -515,9 +553,12 @@ function buildL3Row(l3, l2Key) {
     const pnlC   = c.col === 'pnl_history' ? pnlCls(l3.pnl_history)
                   : c.col === 'pnl_today'  ? pnlCls(l3.pnl_today)
                   : c.col === 'pnl_daily'  ? pnlCls(l3.pnl_daily) : '';
+    // 数字列默认右对齐；文本列默认左对齐
+    const defAlign = isNumCol(c.col) ? 'right' : 'left';
+    const align = c.align ? `text-align:${c.align==='R'?'right':'left'};` : `text-align:${defAlign};`;
     const cls    = [numCls, tagCls, pnlC].filter(Boolean).join(' ');
 
-    html += `<td class="${cls}">${fmt(v, null, c.fmt)}</td>`;
+    html += `<td class="${cls}" style="${align}">${fmt(v, null, c.fmt, c.pct)}</td>`;
   }
 
   tr.innerHTML = html;
@@ -549,16 +590,32 @@ function tagGC(v) { const a=Math.abs(v); if(a>=60000)  return 'red'; if(a>=30000
 
 // ─── 折叠 ────────────────────────────────────────────────────────────────────
 function toggleG(key) {
-  if (State.expandedG.has(key)) {
+  const isExp = State.expandedG.has(key);
+  if (isExp) {
+    // 折叠：收起 L1 及所有子 L2
     State.expandedG.delete(key);
+    const l1 = (State.snapshot?.tree || []).find(n => n.key === key);
+    if (l1) {
+      for (const l2 of (l1.children || [])) {
+        State.expandedM.delete(l2.key);
+      }
+    }
   } else {
+    // 展开：L1 展开，同时展开其下所有 L2
     State.expandedG.add(key);
+    const l1 = (State.snapshot?.tree || []).find(n => n.key === key);
+    if (l1) {
+      for (const l2 of (l1.children || [])) {
+        State.expandedM.add(l2.key);
+      }
+    }
   }
   render();
 }
 
 function toggleM(key) {
-  if (State.expandedM.has(key)) {
+  const isExp = State.expandedM.has(key);
+  if (isExp) {
     State.expandedM.delete(key);
   } else {
     State.expandedM.add(key);
@@ -591,11 +648,11 @@ function _toggle_settings() {
 
 function switchSettingsTab(tab) {
   document.querySelectorAll('.settings-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-content').forEach(t => { t.style.display = 'none'; });
+  document.querySelectorAll('.tab-content, .col-config-panel').forEach(t => { t.style.display = 'none'; });
   const tabEl = document.querySelector('.settings-tab[onclick="switchSettingsTab(\'' + tab + '\')"]');
   if (tabEl) tabEl.classList.add('active');
   const contentEl = document.getElementById('tab-' + tab);
-  if (contentEl) contentEl.style.display = '';
+  if (contentEl) contentEl.style.display = 'block';
   if (tab === 'cols') renderColConfigPanel();
 }
 
@@ -609,9 +666,6 @@ function renderColConfigPanel() {
         onchange="toggleColVisible(${i}, this.checked)">
       <span class="col-name">${c.label || c.col}</span>
       <button onclick="moveCol(${i}, -1)" ${i === 0 ? 'disabled' : ''}>←</button>
-      <input type="text" value="${c.fmt || ''}" size="7"
-        placeholder="格式"
-        onchange="setColFmt(${i}, this.value)">
       <button onclick="moveCol(${i}, 1)" ${i === COL_DEF.length - 1 ? 'disabled' : ''}>→</button>
     </div>
   `).join('');
@@ -635,16 +689,9 @@ function toggleColVisible(idx, visible) {
   render();
 }
 
-function setColFmt(idx, fmt) {
-  COL_DEF[idx].fmt = fmt || null;
-  saveColConfig();
-  renderHead();
-  render();
-}
-
 function doFilterByUnder(val) {
   State.filterTxt = val || '';
-  if (State.snapshot) render();
+  render();
 }
 
 async function loadConfig() {
@@ -704,107 +751,112 @@ async function doReconnectFromModal() {
   await doConnect();
 }
 
-// ─── 历史快照面板（离线查看）─────────────────────────────────────────────────
-async function openSnapshotPanel() {
-  const panel = document.getElementById('snapshot-panel');
-  if (!panel) return;
-  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+// ─── 切片弹窗 ─────────────────────────────────────────────────────────────────
+let _snapSelDate = '';
+let _snapSelSess = '';
 
-  const data = await fetch_json('/api/snapshots?t=' + Date.now());
-  if (!data) return;
-
-  const groups = { N: [], A: [], P: [] };
-  (Array.isArray(data) ? data : []).forEach(s => {
-    const k = s.session || '?';
-    (groups[k] = groups[k] || []).push(s);
-  });
-
-  const map = { N: 'snap-n', A: 'snap-a', P: 'snap-p' };   // N 排最前
-  for (const ss of ['N', 'A', 'P']) {
-    const wrap = document.getElementById(map[ss]);
-    if (!wrap) continue;
-    const arr = (groups[ss] || []).sort((a, b) =>
-      (b.trading_date || '').localeCompare(a.trading_date || ''));
-    wrap.innerHTML = arr.length
-      ? arr.map(s => `<button class="btn btn-toggle" onclick="loadSnapshot('${s.name}')">`
-          + `${ss} ${s.trading_date} (${s.position_count})</button>`).join('')
-      : '<span style="color:#2a3a4a;font-size:11px;">无</span>';
-  }
-  panel.style.display = '';
+function openSnapModal() {
+  _snapSelDate = '';
+  _snapSelSess = '';
+  const modal = document.getElementById('snap-modal');
+  const dateIn = document.getElementById('snap-date');
+  const sessBtns = document.getElementById('snap-session-btns');
+  const msg = document.getElementById('snap-msg');
+  // 默认选今天
+  const today = new Date();
+  dateIn.value = today.toISOString().slice(0, 10);
+  _snapSelDate = dateIn.value;
+  sessBtns.style.display = 'none';
+  msg.textContent = '';
+  document.querySelectorAll('.snap-sess-btn').forEach(b => b.style.borderColor = '#2a3a4a');
+  modal.style.display = 'flex';
+  // 触发日期检查
+  onSnapDateChange();
 }
 
-async function loadSnapshot(name) {
+function onSnapDateChange() {
+  const dateVal = document.getElementById('snap-date').value;
+  _snapSelDate = dateVal;
+  _snapSelSess = '';
+  const sessBtns = document.getElementById('snap-session-btns');
+  const msg = document.getElementById('snap-msg');
+  if (!dateVal) {
+    sessBtns.style.display = 'none';
+    msg.textContent = '请选择日期';
+    return;
+  }
+  // 查询该日期有哪些切片
+  fetch_json('/api/snapshots?t=' + Date.now()).then(data => {
+    // trading_date 格式是 YYYYMMDD，date input 值格式是 YYYY-MM-DD，统一转换
+    const dateYMD = dateVal.replace(/-/g, '');
+    const hasN = !!(data || []).find(s => s.trading_date === dateYMD && s.session === 'N');
+    const hasA = !!(data || []).find(s => s.trading_date === dateYMD && s.session === 'A');
+    const hasP = !!(data || []).find(s => s.trading_date === dateYMD && s.session === 'P');
+    sessBtns.style.display = 'flex';
+    document.querySelectorAll('.snap-sess-btn').forEach(b => {
+      const s = b.dataset.sess;
+      const exists = (s === 'N' && hasN) || (s === 'A' && hasA) || (s === 'P' && hasP);
+      b.style.opacity = exists ? '1' : '0.3';
+      b.style.cursor = exists ? 'pointer' : 'not-allowed';
+      b.style.borderColor = '#2a3a4a';
+    });
+    if (!hasN && !hasA && !hasP) {
+      msg.textContent = '该日期无切片数据';
+    } else {
+      msg.textContent = '';
+    }
+  });
+}
+
+function selectSnapSess(sess) {
+  const btn = document.querySelector(`.snap-sess-btn[data-sess="${sess}"]`);
+  if (!btn || btn.style.cursor === 'not-allowed') return;
+  _snapSelSess = sess;
+  document.querySelectorAll('.snap-sess-btn').forEach(b => b.style.borderColor = '#2a3a4a');
+  btn.style.borderColor = '#4a9eff';
+  document.getElementById('snap-msg').textContent = '';
+}
+
+async function confirmSnapLoad() {
+  if (!_snapSelDate || !_snapSelSess) {
+    document.getElementById('snap-msg').textContent = '请先选择日期和场次';
+    return;
+  }
+  const name = `data_snapshot_${_snapSelDate.replace(/-/g, '')}_${_snapSelSess}.json`;
   const data = await fetch_json('/api/snapshot/load', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name }),
+    body: JSON.stringify({ name }),
   });
-  if (!data || data.status !== 'ok') return;
-
-  State.snapshotMode  = true;
-  State.snapshotLabel = `${data.session || ''} ${data.trading_date || ''} ${data.saved_at || ''}`.trim();
+  if (!data || data.status !== 'ok') {
+    document.getElementById('snap-msg').textContent = '加载失败';
+    return;
+  }
+  State.snapshotMode = true;
+  State.snapshotLabel = `${_snapSelSess === 'N' ? '夜盘' : _snapSelSess === 'A' ? '早盘' : '午盘'} ${_snapSelDate}`;
   State.snapshot = {
     status: 'snapshot',
     tree: data.tree || [],
     summary: data.summary || {},
     positions: data.positions || [],
   };
-
-  // 展开全部
-  State.expandedG.clear(); State.expandedM.clear();
+  State.expandedG.clear();
+  State.expandedM.clear();
   (data.tree || []).forEach(l1 => {
     State.expandedG.add(l1.key);
     (l1.children || []).forEach(l2 => State.expandedM.add(l2.key));
   });
-
+  closeSnapModal();
   render();
   renderSummary(data.summary || {});
-
-  // 数据源 banner
-  const banner = document.getElementById('mode-banner');
-  const bt = document.getElementById('mode-banner-text');
-  if (bt) bt.textContent = '[快照] ' + State.snapshotLabel;
-  if (banner) banner.style.display = 'flex';
-
-  // viewer 元信息 + 无树时降级渲染平铺持仓
-  const viewer = document.getElementById('snapshot-viewer');
-  const title  = document.getElementById('snap-title');
-  const wrap   = document.getElementById('snap-table-wrap');
-  const pos = data.positions || [];
-  if (title) title.textContent = `快照 ${name} | ${pos.length} 条持仓`;
-  if (wrap) {
-    wrap.innerHTML = (data.tree && data.tree.length) ? ''
-      : renderFlatPositions(pos);
-  }
-  if (viewer) viewer.style.display = '';
 }
 
-// 无 tree 时降级：平铺持仓表
-function renderFlatPositions(pos) {
-  if (!pos.length) return '<div style="color:#8ba3b8;padding:8px 0;">该快照无持仓</div>';
-  const cols = ['symbol', 'direction', 'volume', 'last_price', 'pnl_history'];
-  const head = ['合约', '方向', '数量', '最新价', '浮动盈亏']
-    .map(h => `<th style="text-align:right;color:#8ba3b8;padding:4px 8px;">${h}</th>`).join('');
-  const rows = pos.map(p => '<tr>' + cols.map(c => {
-    const v = (c === 'direction') ? (p.direction === 'long' ? '多' : '空') : fmt(p[c], c === 'volume' ? 0 : 2);
-    const cl = c === 'pnl_history' ? pnlCls(p.pnl_history) : '';
-    return `<td class="${cl}" style="text-align:right;padding:4px 8px;">${v}</td>`;
-  }).join('') + '</tr>').join('');
-  return `<table style="width:100%;border-collapse:collapse;font-size:12px;padding:0 20px;">
-    <thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
-}
-
-function closeSnapshot() {
-  const viewer = document.getElementById('snapshot-viewer');
-  if (viewer) viewer.style.display = 'none';
+function closeSnapModal() {
+  document.getElementById('snap-modal').style.display = 'none';
 }
 
 function returnToLive() {
   State.snapshotMode = false;
-  const banner = document.getElementById('mode-banner');
-  if (banner) banner.style.display = 'none';
-  const viewer = document.getElementById('snapshot-viewer');
-  if (viewer) viewer.style.display = 'none';
   fetchDashboard();
 }
 
@@ -819,7 +871,8 @@ async function init() {
   renderHead();
 
   // 折叠按钮
-  document.getElementById('btn-expand')?.addEventListener('click', () => {
+  document.getElementById('btn-expand')?.addEventListener('click', e => {
+    e.stopPropagation();
     const snap = State.snapshot;
     if (!snap) return;
     for (const l1 of snap.tree || []) {
@@ -831,7 +884,8 @@ async function init() {
     render();
   });
 
-  document.getElementById('btn-collapse')?.addEventListener('click', () => {
+  document.getElementById('btn-collapse')?.addEventListener('click', e => {
+    e.stopPropagation();
     State.expandedG.clear();
     State.expandedM.clear();
     render();

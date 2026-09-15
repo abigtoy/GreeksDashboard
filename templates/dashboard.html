@@ -59,22 +59,30 @@ tr.itm-short { background: #2a1a1a; }
 tr.itm-short:hover { background: #3a2222; }
 tr.collapsed { display: none; }
 
-/* 品种汇总行 */
-tr.group-row { background: #141d28; font-weight: 600; cursor: pointer; }
-tr.group-row td { color: #8ba3b8; font-size: 11px; }
-tr.group-row:hover { background: #1a2535; }
-.group-sym { color: #e8e8e8 !important; font-weight: 700; }
+/* 品种汇总行 - L1 */
+tr.group-row { background: #0c1218; font-weight: 700; cursor: pointer; border-bottom: 1px solid #1a2535; }
+tr.group-row td { color: #d8e0e8; font-size: 11px; }
+tr.group-row:hover { background: #141e2a; }
+.group-sym { color: #e8e8e8 !important; font-weight: 700; padding-left: 8px !important; }
 
-/* 月份汇总行 */
-tr.month-row { background: #1a2535; cursor: pointer; }
-tr.month-row:hover { background: #1e2d40; }
-tr.month-row td { color: #8ba3b8; font-size: 11px; }
+/* 月份汇总行 - L2 */
+tr.month-row { background: #141c26; cursor: pointer; border-bottom: 1px solid #1a2535; }
+tr.month-row:hover { background: #1a2636; }
+tr.month-row td { color: #b8c4d0; font-size: 11px; }
 tr.month-row.collapsed { display: none; }
+.month-sym { color: #c8d4e0 !important; font-weight: 600; padding-left: 20px !important; }
+
+/* 合约明细行 - L3 */
+tr.pos-row { background: #1a2535; border-bottom: 1px solid #151d28; }
+tr.pos-row:hover { background: #202e42; }
 tr.pos-row.collapsed { display: none; }
-.month-sym { color: #e8e8e8 !important; font-weight: 600; padding-left: 20px !important; }
+tr.pos-row td { color: #8898a8; font-size: 11px; }
+tr.pos-row td:first-child { padding-left: 0 !important; }
+tr.pos-row.l3-indent td:first-child { padding-left: 0 !important; }
+.l3-sym { color: #8898a8 !important; padding-left: 32px !important; display: inline-block; }
 
 /* 合计行 */
-tr.total-row { background: #12233d; font-weight: 700; border-top: 2px solid #2a3a5a; }
+tr.total-row { background: #0d1420; font-weight: 700; border-top: 2px solid #2a3a5a; }
 tr.total-row td { color: #e8e8e8; font-size: 12px; }
 .total-label { color: #e8e8e8 !important; font-weight: 700; padding-left: 20px !important; }
 
@@ -202,15 +210,14 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   </div>
   <button type="button" class="btn btn-ctp" id="btn-ctp" onclick="onCtpBtnClick()">● 连接CTP</button>
   <button type="button" class="btn btn-toggle" id="btn-settings">⚙ 看板设置</button>
+  <button type="button" class="btn btn-toggle" id="btn-snapshot" onclick="openSnapModal()">📁 切片</button>
 </div>
 
 <div id="settings-panel">
   <div class="settings-inner">
     <div class="settings-tabs">
       <button class="settings-tab active" onclick="switchSettingsTab('ctp')">CTP连接</button>
-      <button class="settings-tab" onclick="switchSettingsTab('cols')">列设置</button>
-      <button class="settings-tab" onclick="switchSettingsTab('fmt')">数据格式</button>
-      <button class="settings-tab" onclick="openSnapshotPanel()">📋 历史快照</button>
+      <button class="settings-tab" onclick="switchSettingsTab('cols')">⚙ 列设置</button>
     </div>
 
     <!-- CTP 连接面板 -->
@@ -229,16 +236,11 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
     </div>
     </div>
 
-    <!-- 列显示/顺序配置 -->
-    <div id="tab-cols" class="tab-content" style="display:none;">
+    <!-- 列设置面板 -->
+    <div id="tab-cols" class="col-config-panel">
       <div class="col-config-grid" id="col-config-list"></div>
     </div>
 
-    <!-- 数据格式配置 -->
-    <div id="tab-fmt" class="tab-content" style="display:none;">
-      <div class="col-config-grid" id="fmt-config-list"></div>
-      <div class="col-iv-note">IV 列固定显示为百分比格式，无需配置</div>
-    </div>
   </div>
 </div>
 
@@ -247,34 +249,13 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   <div class="summary-item"><div class="label">ΓCash</div><div class="value gamma" id="sumGC">-</div></div>
   <div class="summary-item"><div class="label">VegaCash</div><div class="value vega" id="sumVC">-</div></div>
   <div class="summary-item"><div class="label">ΘCash</div><div class="value theta" id="sumTC">-</div></div>
+  <div class="summary-item"><div class="label">盯日盈亏</div><div class="value pnl" id="sumPnlD">-</div></div>
   <div class="summary-item"><div class="label">当日盈亏</div><div class="value pnl" id="sumPnlT">-</div></div>
   <div class="summary-item"><div class="label">浮动盈亏</div><div class="value pnl" id="sumPnlH">-</div></div>
   <div class="summary-item"><div class="label">持仓数</div><div class="value" id="posCount">-</div></div>
 </div>
 
-<div id="snapshot-panel" style="display:none; background:#141d28; border-bottom:1px solid #2a3a4a;">
-  <div style="padding:10px 20px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-    <span style="color:#8ba3b8; font-size:11px;">历史快照:</span>
-    <div id="snap-n" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
-    <div style="color:#2a3a4a;">|</div>
-    <div id="snap-a" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
-    <div style="color:#2a3a4a;">|</div>
-    <div id="snap-p" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
-  </div>
-</div>
-<div id="snapshot-viewer" style="display:none; background:#0f1a24; border-bottom:1px solid #2a3a4a; max-height:300px; overflow-y:auto;">
-  <div style="padding:8px 20px; display:flex; justify-content:space-between; align-items:center;">
-    <span id="snap-title" style="color:#4a9eff; font-size:12px;"></span>
-    <button onclick="closeSnapshot()" style="background:#1a3a5c; color:#4a9eff; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:11px;">关闭</button>
-  </div>
-  <div id="snap-table-wrap" style="padding:0 20px 10px;"></div>
-</div>
 
-<!-- 数据源切换banner -->
-<div id="mode-banner" style="display:none; background:#1a2a3a; border-bottom:2px solid #4a9eff; padding:8px 20px; display:flex; align-items:center; gap:12px;">
-  <span style="color:#4a9eff; font-size:12px;">📋 当前显示: <span id="mode-banner-text"></span></span>
-  <button onclick="returnToLive()" style="background:#1a3a5c; color:#4a9eff; border:none; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:11px;">← 返回实时</button>
-</div>
 
 <div class="wrap">
   <div class="section-title">持仓明细</div>
@@ -299,6 +280,25 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   </div>
 </div>
 
-<script src="/static/dashboard11.js"></script>
+<div id="snap-modal" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.75); z-index:9999; align-items:center; justify-content:center;">
+  <div style="background:#1a2332; border:1px solid #2a3a4a; border-radius:8px; padding:28px 36px; min-width:360px; text-align:center;">
+    <div style="color:#4a9eff; font-size:16px; font-weight:600; margin-bottom:20px;">📁 加载切片数据</div>
+    <div style="margin-bottom:16px;">
+      <input type="date" id="snap-date" onchange="onSnapDateChange()" style="background:#0f1419; border:1px solid #2a3a4a; color:#e8e8e8; padding:8px 12px; font-size:13px; border-radius:4px; outline:none; width:200px;">
+    </div>
+    <div id="snap-session-btns" style="display:none; gap:10px; justify-content:center; margin-bottom:20px;">
+      <button class="snap-sess-btn" data-sess="N" onclick="selectSnapSess('N')" style="background:#141d28; border:1px solid #2a3a4a; color:#e8e8e8; padding:8px 18px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600;">夜盘 N</button>
+      <button class="snap-sess-btn" data-sess="A" onclick="selectSnapSess('A')" style="background:#141d28; border:1px solid #2a3a4a; color:#e8e8e8; padding:8px 18px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600;">早盘 A</button>
+      <button class="snap-sess-btn" data-sess="P" onclick="selectSnapSess('P')" style="background:#141d28; border:1px solid #2a3a4a; color:#e8e8e8; padding:8px 18px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600;">午盘 P</button>
+    </div>
+    <div id="snap-msg" style="color:#8ba3b8; font-size:12px; margin-bottom:16px; min-height:18px;"></div>
+    <div style="display:flex; gap:10px; justify-content:center;">
+      <button onclick="confirmSnapLoad()" style="background:#16a34a; color:#fff; border:none; padding:8px 20px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600;">确认</button>
+      <button onclick="closeSnapModal()" style="background:#2a3a4a; color:#8ba3b8; border:none; padding:8px 20px; border-radius:4px; cursor:pointer; font-size:13px;">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/dashboard11.js?v=11"></script>
 </body>
 </html>

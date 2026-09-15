@@ -324,7 +324,7 @@ def build_tree(positions: list, ticks: dict, contracts: dict,
                 "children": l1_children,
             }
             tree.append(l1_node)
-            _accumulate_summary(total, l1_metrics)
+            _accumulate_summary(total, l1_metrics, sum(len(l2['children']) for l2 in l1_children))
 
     return {"summary": total, "tree": tree}
 
@@ -368,7 +368,7 @@ def _accumulate_metrics(metrics: dict, node: dict) -> None:
     metrics["pnl_history"] += m.get('pnl_history', 0)
 
 
-def _accumulate_summary(total: dict, metrics: dict) -> None:
+def _accumulate_summary(total: dict, metrics: dict, l3_count: int = 1) -> None:
     total["total_deltacash"]   += metrics.get("deltacash", 0)
     total["total_gammacash"]   += metrics.get("gammacash", 0)
     total["total_vegacash"]    += metrics.get("vegacash", 0)
@@ -376,7 +376,7 @@ def _accumulate_summary(total: dict, metrics: dict) -> None:
     total["total_pnl_daily"]   += metrics.get("pnl_daily", 0)
     total["total_pnl_today"]   += metrics.get("pnl_today", 0)
     total["total_pnl_history"] += metrics.get("pnl_history", 0)
-    total["position_count"]    += 1
+    total["position_count"]    += l3_count
 
 
 def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
