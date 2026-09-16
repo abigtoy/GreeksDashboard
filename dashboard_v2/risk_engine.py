@@ -209,7 +209,9 @@ def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
 # 3.5 PnL 三口径（含新开仓/已平仓处理）
 # =======================================================================
 def calc_pnl(position: dict, contract: dict, tick: dict,
-             settlement_dict: dict, yesterday_snapshot: dict = None) -> dict:
+             settlement_dict: dict,
+             settlement_prices: dict = None,
+             yesterday_snapshot: dict = None) -> dict:
     """contract: 合约元数据，含 size（乘数），必须传入，VNPY PositionData 无 size 字段。"""
     sym = position['symbol'].split('.')[0]
     direction_str  = '多' if position['direction'] in ('long', '多') else '空'
@@ -222,10 +224,7 @@ def calc_pnl(position: dict, contract: dict, tick: dict,
         return {"pnl_daily": 0.0, "pnl_today": 0.0, "pnl_history": 0.0}
 
     # 真实开仓成本
-    cost_price = settlement_dict.get(
-        f"{sym}_{direction_str}",
-        position.get('price', 0.0)
-    )
+    cost_price = settlement_dict.get(sym, position.get('price', 0.0))
     # 新开仓（昨价为空）时用开仓价作基准，防止 pnl_today = 0
     if cost_price == 0.0:
         cost_price = position.get('price', 0.0)
@@ -247,13 +246,22 @@ def calc_pnl(position: dict, contract: dict, tick: dict,
         settle_price = contract.get('pre_close', 0) or position.get('price', 0)
     pnl_daily = direction_sign * (last_price - settle_price) * vol * size
 
-    # 当日盈亏（adjust_price 对比昨日快照基准；新开仓用 cost_price）
-    base_today = cost_price  # 默认新开仓用开仓价
+    # 当日盈亏 = adj_price 对比昨快照 adjust_price
+    # 降级链：昨快照 adjust_price → 今结算价 settlement_prices → NaN
+    base_today = None
     if yesterday_snapshot:
         prev = yesterday_snapshot.get(f"{sym}_{direction_str}", {})
         if prev:
-            base_today = prev.get('adjust_price', cost_price)
-    pnl_today = direction_sign * (adj_price - base_today) * vol * size
+            base_today = prev.get('adjust_price')
+    # 降级：取昨结算单的今结算价（full_*.json positions_detail.settlement_price）
+    if base_today is None and settlement_prices:
+        base_today = settlement_prices.get(sym)
+    if base_today is None:
+        import math
+        base_today = math.nan
+    pnl_today = (direction_sign * (adj_price - base_today) * vol * size
+                 if not (isinstance(base_today, float) and base_today != base_today)
+                 else math.nan)
 
     return {
         "pnl_daily":   round(pnl_daily,   2),
@@ -267,6 +275,7 @@ def calc_pnl(position: dict, contract: dict, tick: dict,
 # =======================================================================
 def build_tree(positions: list, ticks: dict, contracts: dict,
                settlement_dict: dict,
+               settlement_prices: dict = None,
                yesterday_snapshot: dict = None) -> dict:
     """
     构建 L1→L2→L3 嵌套树。
@@ -292,7 +301,7 @@ def build_tree(positions: list, ticks: dict, contracts: dict,
             l3_nodes = []
             for pos in product_map[product][month]:
                 node = _build_l3_node(pos, ticks, contracts,
-                                      settlement_dict, yesterday_snapshot)
+                                      settlement_dict, settlement_prices, yesterday_snapshot)
                 if node:
                     l3_nodes.append(node)
                     # L3 只进 L2，L1 汇总在 L2→L1 阶段做（避免 L1 双计）
@@ -381,6 +390,7 @@ def _accumulate_summary(total: dict, metrics: dict, l3_count: int = 1) -> None:
 
 def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
                    settlement_dict: dict,
+                   settlement_prices: dict = None,
                    yesterday_snapshot: dict = None) -> dict | None:
     sym      = pos['symbol'].split('.')[0]
     contract = contracts.get(sym, {})
@@ -391,7 +401,7 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
     g    = calc_greeks(tick, pos, contract)
     tick_with_adj = dict(tick) if tick else {}
     tick_with_adj['adjust_price'] = adj_price
-    pnl = calc_pnl(pos, contract, tick_with_adj, settlement_dict, yesterday_snapshot)
+    pnl = calc_pnl(pos, contract, tick_with_adj, settlement_dict, settlement_prices, yesterday_snapshot)
 
     direction_raw = pos.get('direction', 'long')
     direction_str = '多' if direction_raw in ('long', '多') else '空'
@@ -406,15 +416,14 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
 
     return {
         "key":             f"{sym}_{direction_str}",
-        "name":            sym,                   # 前端显示用
+        "name":            f"{sym}{direction_str}",
         "symbol":          sym,
         "direction":       direction_str,
         "direction_raw":   direction_raw,
         "volume":          pos.get('volume', 0),
         "last_price":      tick.get('last_price', 0),
         "adjust_price":    adj_price,
-        "open_price":      settlement_dict.get(f"{sym}_{direction_str}",
-                                               pos.get('price', 0)),
+        "open_price":      settlement_dict.get(sym, pos.get('price', 0)),
         "underlying_price":tick.get('underlying_price', 0),
         "iv":              tick.get('iv', None),
         "days_to_expiry":  contract.get('days_to_expiry', None),

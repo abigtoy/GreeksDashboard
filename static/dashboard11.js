@@ -35,7 +35,7 @@ const State = {
 let COL_DEF = [
   // 备用默认定义（API 未返回时使用）
   { col: 'symbol',           label: '合约',      fmt: null },
-  { col: 'volume',           label: '数量',      fmt: '0'     },
+  { col: 'volume',           label: '数量',      fmt: '0',      align: 'R' },
   { col: 'underlying_price', label: '标的价',    fmt: '0.00',  align: 'R' },
   { col: 'last_price',       label: '最新价',    fmt: '0.00',  align: 'R' },
   { col: 'adjust_price',     label: '调整价',    fmt: '0.0000',align: 'R' },
@@ -172,6 +172,7 @@ function pnlCls(v) {
 var _ctp_connected = false;
 var _was_connected = false;      // 曾成功连接过 → 掉线才弹重连窗（首次未连不弹）
 var _reconnect_shown = false;
+var _last_ctp_error = '';        // 最近一次错误，disconnected 时仍需保留用于弹窗
 
 function showMsg(text, type) {
   type = type || 'info';
@@ -212,6 +213,7 @@ function updateCtpStatus(status) {
   if (status.login_error_id > 0 && !err) {
     err = '验证失败(' + status.login_error_id + '): ' + (status.login_error_msg || '');
   }
+  if (err) _last_ctp_error = err;  // 保存最近错误，disconnected 时仍可显示
   var connected = (st === 'connected');
 
   if (connected) {
@@ -227,18 +229,19 @@ function updateCtpStatus(status) {
     // 连接中：按钮保持可点，点击即取消（doDisconnect）
     if (btn) { btn.textContent = '○ 连接中·点取消'; btn.className = 'btn btn-ctp pending'; btn.disabled = false; }
     if (err) setMsg(err, 'info');
-    if (_was_connected) showReconnectModal();
+    if (_was_connected) showReconnectModal(err);
   } else if (st === 'error') {
-    ctpEl.textContent = 'CTP连接失败';
+    ctpEl.textContent = err ? ('CTP连接失败: ' + err) : 'CTP连接失败';
     ctpEl.className = 'status-err';
     if (btn) { btn.textContent = '● 失败·重试'; btn.className = 'btn btn-ctp'; btn.disabled = false; }
     if (err) setMsg(err, 'err');
-    if (_was_connected) showReconnectModal();
+    if (_was_connected) showReconnectModal(err);
   } else {  // disconnected
-    ctpEl.textContent = 'CTP未连接';
+    var lastErr = _last_ctp_error;
+    ctpEl.textContent = lastErr ? ('CTP掉线: ' + lastErr) : 'CTP未连接';
     ctpEl.className = 'status-err';
     if (btn) { btn.textContent = '● 连接CTP'; btn.className = 'btn btn-ctp'; btn.disabled = false; }
-    if (_was_connected) showReconnectModal();
+    if (_was_connected && _last_ctp_error) showReconnectModal(_last_ctp_error);
   }
   _ctp_connected = connected;
 }
@@ -285,6 +288,7 @@ async function doDisconnect() {
   if (result && result.success) {
     _ctp_connected = false;
     _was_connected = false;      // 手动断开 → 不弹自动重连窗
+    _last_ctp_error = '';        // 清除错误记录
     updateCtpStatus({ status: 'disconnected', connected: false });
     setMsg('已断开', 'ok');
   } else if (btn) { btn.disabled = false; btn.className = 'btn btn-ctp connected'; btn.textContent = '● 已连接·断开'; }
@@ -464,8 +468,7 @@ function renderSummary(s) {
   set('sumPnlD',  s.total_pnl_daily,   0);
   set('sumPnlT',  s.total_pnl_today,   0);
   set('sumPnlH',  s.total_pnl_history, 0);
-  set('posCount', s.position_count,     0);
-  set('cnt',      s.position_count,     0);
+  set('posCount', snap.tree ? snap.tree.reduce((n, l1) => n + l1.children.reduce((m, l2) => m + (l2.children || []).length, 0), 0) : 0, 0);
 
   // Summary 行颜色
   const pnlH = parseFloat(s.total_pnl_history) || 0;
@@ -689,6 +692,14 @@ function toggleColVisible(idx, visible) {
   render();
 }
 
+function setColFmt(idx, fmt) {
+  COL_DEF[idx].fmt = fmt || null;
+  saveColConfig();
+  renderHead();
+  render();
+  renderColConfigPanel();
+}
+
 function doFilterByUnder(val) {
   State.filterTxt = val || '';
   render();
@@ -733,11 +744,19 @@ async function onAccountSelect(name) {
 }
 
 // ─── 断线重连弹窗 ─────────────────────────────────────────────────────────────
-function showReconnectModal() {
+function showReconnectModal(errMsg) {
   if (_reconnect_shown) return;
   _reconnect_shown = true;
   const m = document.getElementById('reconnect-modal');
-  if (m) m.classList.add('show');
+  if (m) {
+    const p = m.querySelector('.modal-box p');
+    if (p && errMsg) {
+      p.textContent = errMsg;
+    } else if (p) {
+      p.textContent = '网络连接已中断，是否尝试重新连接？';
+    }
+    m.classList.add('show');
+  }
 }
 
 function closeReconnectModal() {
@@ -833,6 +852,8 @@ async function confirmSnapLoad() {
     return;
   }
   State.snapshotMode = true;
+  document.getElementById('btn-return-live').style.display = '';
+  document.getElementById('btn-snapshot').style.display = 'none';
   State.snapshotLabel = `${_snapSelSess === 'N' ? '夜盘' : _snapSelSess === 'A' ? '早盘' : '午盘'} ${_snapSelDate}`;
   State.snapshot = {
     status: 'snapshot',
@@ -857,6 +878,8 @@ function closeSnapModal() {
 
 function returnToLive() {
   State.snapshotMode = false;
+  document.getElementById('btn-return-live').style.display = 'none';
+  document.getElementById('btn-snapshot').style.display = '';
   fetchDashboard();
 }
 

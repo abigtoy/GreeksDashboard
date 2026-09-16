@@ -60,17 +60,17 @@ tr.itm-short:hover { background: #3a2222; }
 tr.collapsed { display: none; }
 
 /* 品种汇总行 - L1 */
-tr.group-row { background: #0c1218; font-weight: 700; cursor: pointer; border-bottom: 1px solid #1a2535; }
-tr.group-row td { color: #d8e0e8; font-size: 11px; }
-tr.group-row:hover { background: #141e2a; }
+tr.group-row { background: #080e16; font-weight: 700; cursor: pointer; border-bottom: 1px solid #1a2535; }
+tr.group-row td { color: #e0e8f0; font-size: 11px; }
+tr.group-row:hover { background: #0e1824; }
 .group-sym { color: #e8e8e8 !important; font-weight: 700; padding-left: 8px !important; }
 
 /* 月份汇总行 - L2 */
-tr.month-row { background: #141c26; cursor: pointer; border-bottom: 1px solid #1a2535; }
-tr.month-row:hover { background: #1a2636; }
-tr.month-row td { color: #b8c4d0; font-size: 11px; }
+tr.month-row { background: #111b28; cursor: pointer; border-bottom: 1px solid #1a2535; }
+tr.month-row:hover { background: #182338; }
+tr.month-row td { color: #b8c8d8; font-size: 11px; }
 tr.month-row.collapsed { display: none; }
-.month-sym { color: #c8d4e0 !important; font-weight: 600; padding-left: 20px !important; }
+.month-sym { color: #c0c8d8 !important; font-weight: 600; padding-left: 20px !important; }
 
 /* 合约明细行 - L3 */
 tr.pos-row { background: #1a2535; border-bottom: 1px solid #151d28; }
@@ -79,7 +79,7 @@ tr.pos-row.collapsed { display: none; }
 tr.pos-row td { color: #8898a8; font-size: 11px; }
 tr.pos-row td:first-child { padding-left: 0 !important; }
 tr.pos-row.l3-indent td:first-child { padding-left: 0 !important; }
-.l3-sym { color: #8898a8 !important; padding-left: 32px !important; display: inline-block; }
+.l3-sym { color: #8898a8 !important; padding-left: 36px !important; display: inline-block; }
 
 /* 合计行 */
 tr.total-row { background: #0d1420; font-weight: 700; border-top: 2px solid #2a3a5a; }
@@ -149,6 +149,7 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
 .col-config-item { display: flex; align-items: center; gap: 6px; background: #0f1419; border: 1px solid #2a3a4a; border-radius: 4px; padding: 6px 10px; }
 .col-config-item input[type="checkbox"] { width: 14px; height: 14px; accent-color: #4a9eff; }
 .col-config-item .col-name { flex: 1; color: #e8e8e8; font-size: 11px; min-width: 50px; }
+.col-config-item .col-fmt { font-size: 10px; color: #7a9ab8; min-width: 50px; text-align: right; font-family: monospace; }
 .col-config-item button { background: #141d28; border: 1px solid #2a3a4a; color: #e8e8e8; font-size: 12px; padding: 2px 8px; border-radius: 3px; cursor: pointer; }
 .col-config-item button:hover:not([disabled]) { background: #1a3050; }
 .col-config-item button[disabled] { opacity: 0.3; cursor: not-allowed; }
@@ -201,7 +202,7 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   <button type="button" class="btn btn-toggle" id="btn-collapse">− 折叠</button>
   <button type="button" class="btn btn-toggle" id="btn-expand">+ 展开</button>
   <div style="display:flex;align-items:center;gap:6px;">
-    <input type="text" id="f-undersearch" placeholder="品种筛选" value="" autocomplete="off" oninput="doFilterByUnder(this.value)"
+    <input type="text" id="f-undersearch" placeholder="品种筛选" value="" autocomplete="off" oninput="onFilter(this.value)"
            style="background:#0f1419;border:1px solid #2a3a4a;color:#e8e8e8;padding:4px 10px;font-size:12px;border-radius:4px;width:120px;outline:none;">
   </div>
   <div class="hdr-account">
@@ -211,6 +212,7 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   <button type="button" class="btn btn-ctp" id="btn-ctp" onclick="onCtpBtnClick()">● 连接CTP</button>
   <button type="button" class="btn btn-toggle" id="btn-settings">⚙ 看板设置</button>
   <button type="button" class="btn btn-toggle" id="btn-snapshot" onclick="openSnapModal()">📁 切片</button>
+  <button type="button" class="btn btn-toggle" id="btn-return-live" onclick="returnToLive()" style="display:none">← 返回实时</button>
 </div>
 
 <div id="settings-panel">
@@ -299,6 +301,6 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   </div>
 </div>
 
-<script src="/static/dashboard11.js?v=11"></script>
+<script src="/static/dashboard11.js?v=12"></script>
 </body>
 </html>

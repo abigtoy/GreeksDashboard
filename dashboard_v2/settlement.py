@@ -36,92 +36,95 @@ def _parse_direction(raw: str) -> str:
 # -----------------------------------------------------------------------
 # 策略1：嗅探券商预计算汇总均价
 # -----------------------------------------------------------------------
-def _load_from_summary(settlement_json: dict) -> dict:
-    result = {}
-    summary_list = (
-        settlement_json.get('positions')
-        or settlement_json.get('positions_summary')
-        or []
-    )
-    for item in summary_list:
-        sym = (
-            item.get('instrument')
-            or item.get('symbol')
-            or item.get('instrument_id')
-            or ''
-        )
-        if not sym:
-            continue
-        avg_buy  = item.get('avg_buy') or item.get('avg_open_price') or item.get('vwap') or 0.0
-        long_pos  = item.get('long_pos', 0)
-        if long_pos and float(avg_buy) > 0:
-            result[f"{sym}_多"] = round(float(avg_buy), 4)
-
-        avg_sell = item.get('avg_sell') or item.get('avg_open_price_short') or 0.0
-        short_pos = item.get('short_pos', 0)
-        if short_pos and float(avg_sell) > 0:
-            result[f"{sym}_空"] = round(float(avg_sell), 4)
-    return result
-
-# -----------------------------------------------------------------------
-# 策略2：逐笔明细加权自算 VWAP
-# -----------------------------------------------------------------------
-def _load_from_detail(settlement_json: dict) -> dict:
-    details = settlement_json.get('positions_detail') or []
-    calc = defaultdict(lambda: {"total_cost": 0.0, "total_vol": 0})
+# ---------------------------------------------------------------------------
+# 净仓聚合辅助函数
+# ---------------------------------------------------------------------------
+def _net_aggregate(details: list, price_field: str) -> dict[str, float]:
+    """
+    按合约聚合净仓价格。
+    net_vol  = Σ多vol - Σ空vol          （可正可负）
+    net_price = (Σ多vol×多均价 - Σ空vol×空均价) / net_vol
+    key = symbol（不带方向后缀）
+    返回: { "IC2612": +7434.44, "IC2609": -6800.0, ... }
+    """
+    agg: dict[str, dict[str, float]] = defaultdict(lambda: {"long_vol": 0, "short_vol": 0, "long_cost": 0.0, "short_cost": 0.0})
     for item in details:
-        sym = item.get('instrument') or item.get('symbol') or item.get('instrument_id') or ''
+        sym = item.get('instrument', '')
         if not sym:
             continue
-        raw_dir = item.get('bs') or item.get('direction') or item.get('side') or ''
-        direction = _parse_direction(raw_dir)
-        price = item.get('open_price') or item.get('price') or item.get('trade_price') or 0.0
-        vol   = item.get('volume') or item.get('vol') or item.get('qty') or 0
-        try:
-            p, v = float(price), int(vol)
-            if p > 0 and v > 0:
-                key = f"{sym}_{direction}"
-                calc[key]["total_cost"] += p * v
-                calc[key]["total_vol"]  += v
-        except (ValueError, TypeError):
+        direction = item.get('direction', '')
+        price = float(item.get(price_field) or 0)
+        vol = int(item.get('volume') or 0)
+        if price <= 0 or vol <= 0:
             continue
+        a = agg[sym]
+        if direction == '多':
+            a["long_cost"] += price * vol
+            a["long_vol"] += vol
+        else:
+            a["short_cost"] += price * vol
+            a["short_vol"] += vol
 
     result = {}
-    for key, data in calc.items():
-        if data["total_vol"] > 0:
-            result[key] = round(data["total_cost"] / data["total_vol"], 4)
+    for sym, a in agg.items():
+        net_vol = a["long_vol"] - a["short_vol"]
+        if net_vol == 0:
+            continue
+        net_price = (a["long_cost"] - a["short_cost"]) / net_vol
+        result[sym] = round(net_price, 4)
     return result
 
-# -----------------------------------------------------------------------
-# 主入口：双策略加载
-# -----------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 开仓均价 — 净仓聚合
+# ---------------------------------------------------------------------------
+def _load_cost_by_net_pos(settlement_json: dict) -> dict:
+    details = settlement_json.get('positions_detail') or []
+    return _net_aggregate(details, 'open_price')
+
+# 保留旧函数名（兼容）
+def _load_from_summary(settlement_json: dict) -> dict:
+    return _load_cost_by_net_pos(settlement_json)
+
+def _load_from_detail(settlement_json: dict) -> dict:
+    return _load_cost_by_net_pos(settlement_json)
+
 def load_settlement_cost(settlement_json: dict) -> dict:
     """
-    双策略加载结算单加权开仓成本。
-    策略1 → 策略2 顺序执行，后者覆盖前者（明细 VWAP 优先于汇总均价）。
-    返回: { "IF2609_多": 4210.0, "IC2609_空": 8048.6, ... }
+    净仓聚合开仓均价。
+    返回: { "IC2612": 7434.44, "IC2609": 8048.6, ... }
     """
-    result = {}
-    s1 = _load_from_summary(settlement_json)
-    result.update(s1)
-    s2 = _load_from_detail(settlement_json)
-    result.update(s2)
-    return result
+    return _load_cost_by_net_pos(settlement_json)
 
-# -----------------------------------------------------------------------
-# 便捷函数：给定 symbol + direction，返回开仓成本
-# -----------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 结算价 — 净仓聚合
+# ---------------------------------------------------------------------------
+def load_settlement_prices(settlement_json: dict) -> dict:
+    """
+    净仓聚合今结算价（Settlement Price）。
+    今结算价 = pnl_today 基准价（降级链：昨快照 adjust_price → 今结算价 → NaN）。
+    返回: { "IC2612": 7347.4, "IC2609": 7565.0, ... }
+    """
+    details = settlement_json.get('positions_detail') or []
+    return _net_aggregate(details, 'settlement_price')
+
+
+# ---------------------------------------------------------------------------
+# 便捷函数
+# ---------------------------------------------------------------------------
 def get_cost(settlement_dict: dict, symbol: str, direction: str) -> float:
-    d = _parse_direction(direction)
-    return settlement_dict.get(f"{symbol}_{d}", 0.0)
+    """查询单合约净仓均价（key 不带方向后缀）。"""
+    return settlement_dict.get(symbol, 0.0)
 
-# -----------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # 目录级加载器（同步，一次性）
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def load_settlement_sync(dir_path: str) -> dict:
     """
     扫描 dir_path 目录，加载最新的 full_*.json，
-    返回 {f"{symbol}_多": avg_buy_price, f"{symbol}_空": avg_sell_price}。
+    返回净仓聚合开仓均价: { "IC2612": 7434.44, ... }
     """
     pattern = glob.glob(str(dir_path).rstrip('/\\') + '/full_*.json')
     if not pattern:
@@ -132,19 +135,7 @@ def load_settlement_sync(dir_path: str) -> dict:
             data = json.load(f)
     except Exception:
         return {}
-
-    result = {}
-    for p in data.get('positions', []):
-        sym = p.get('instrument', '') or p.get('symbol', '') or ''
-        if not sym:
-            continue
-        avg_buy  = round(float(p.get('avg_buy_price')  or 0), 4)
-        avg_sell = round(float(p.get('avg_sell_price') or 0), 4)
-        if avg_buy > 0:
-            result[f"{sym}_多"] = avg_buy
-        if avg_sell > 0:
-            result[f"{sym}_空"] = avg_sell
-    return result
+    return load_settlement_cost(data)
 
 # =======================================================================
 # SettlementManager — 状态管理器（增量同步 + 日期标记）
@@ -233,6 +224,7 @@ class SettlementManager:
     def __init__(self, api_url: str = SETTLEMENT_API):
         self.api_url   = api_url
         self._cost_cache: dict[str, float] = {}
+        self._price_cache: dict[str, float] = {}
         self._meta     = _read_meta()
 
     # ------------------------------------------------------------------
@@ -286,6 +278,10 @@ class SettlementManager:
         """
         return self._cost_cache.copy()
 
+    def get_all_prices(self) -> dict[str, float]:
+        """返回内存中缓存的昨结算价字典（昨结算价 = pnl_today 基准）。"""
+        return self._price_cache.copy()
+
     def get_cost(self, symbol: str, direction: str) -> float | None:
         """查询单条开仓成本，无数据返回 None。"""
         d = _parse_direction(direction)
@@ -309,7 +305,8 @@ class SettlementManager:
         try:
             with open(path, encoding='utf-8') as f:
                 data = json.load(f)
-            self._cost_cache = load_settlement_cost(data)
+            self._cost_cache  = load_settlement_cost(data)
+            self._price_cache = load_settlement_prices(data)
         except Exception:
             pass
 
@@ -362,84 +359,258 @@ class SettlementManager:
 
         return True, ""
 
+    # ------------------------------------------------------------------
+    # 内部工具
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_section_header(lines: list[str], keywords: tuple[str, ...]) -> int | None:
+        """返回包含所有 keywords 的行号（严格AND），未找到返回 None。"""
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if all(kw in s for kw in keywords):
+                return i
+        return None
+
+    @staticmethod
+    def _parse_pipe_header(header_line: str) -> tuple[list[str], dict[str, int]]:
+        """
+        解析 pipe 分隔的 header 行，返回 (col_names, col_index_map)。
+        col_index_map key: 英文 lower → idx（取第一个匹配）。
+        """
+        raw_cols = [c.strip() for c in header_line.split('|')[1:-1]]
+        col_map = {}
+        for idx, col in enumerate(raw_cols):
+            cl = col.lower()
+            if cl and col_map.get(cl) is None:
+                col_map[cl] = idx
+        return raw_cols, col_map
+
+    @staticmethod
+    def _parse_pipe_row(line: str, all_col_names: list[str]) -> dict[str, str] | None:
+        """解析单行 pipe 分隔数据，返回 {col_name: value} 或 None。"""
+        s = line.strip()
+        if not s or s.startswith('|---') or '-------' in s:
+            return None
+        if s.startswith('|'):
+            s = s[1:]
+        if s.endswith('|'):
+            s = s[:-1]
+        parts = [p.strip() for p in s.split('|')]
+        if len(parts) < 2:
+            return None
+        return dict(zip(all_col_names, parts[:len(all_col_names)]))
+
+    @staticmethod
+    def _parse_account_summary(lines: list[str], start: int) -> dict:
+        """
+        解析资金状况区域（start 附近约40行）。
+        每行格式:  Key：Value  Key：Value（双字节冒号，变长空格分隔）
+        用正则匹配所有 key：value 对，key 支持中英文标签。
+        """
+        import re
+        result = {}
+        for line in lines[start:start + 50]:
+            raw = line.strip()
+            if not raw or '：' not in raw:
+                continue
+            if raw.startswith('|---') or '-------' in raw or raw.startswith('|'):
+                continue
+            # 匹配 [任意空白]key[任意空白]：value
+            # 贪婪匹配key部分，值取冒号后到行尾或下一key前
+            for seg_m in re.finditer(r'([^\s：]+)：\s*([\d.\-]+|[^\s：]+(?:\s+[^\s：]+：[^\s：]+)*)', raw):
+                raw_key = seg_m.group(1).strip()
+                raw_val = seg_m.group(2).strip()
+                # 提取英文标签（括号内）
+                en_key = raw_key
+                if '(' in raw_key and ')' in raw_key:
+                    try:
+                        en_key = raw_key[raw_key.index('(') + 1:raw_key.index(')')]
+                    except ValueError:
+                        pass
+                try:
+                    result[en_key] = float(raw_val.replace(',', ''))
+                except ValueError:
+                    result[en_key] = raw_val
+        return result
+
+    @staticmethod
+    def _is_symbol(s: str) -> bool:
+        """判断是否疑似交易合约代码（非交易所内部编码）。"""
+        return bool(s and len(s) >= 3 and s[0].isalpha() and any(c.isdigit() for c in s))
+
+    # ------------------------------------------------------------------
+    # 多表解析
+    # ------------------------------------------------------------------
     def _parse_txt(self, trading_date: str, txt_path: str) -> tuple[bool, str]:
         """
-        将 ctp_settlement_{date}.txt（pipe分隔表格格式）解析为 full_*.json。
-        CTP结算单格式：|AccountID|BrokerID|Product|Instrument|LongPos.|AvgBuyPrice|ShortPos.|AvgSellPrice|...|
+        将 ctp_settlement_{date}.txt（pipe 分隔表格格式）解析为 full_*.json。
+        动态检测所有表：资金状况、成交记录、行权明细（有则解析）、平仓明细、持仓明细。
+        只剔除交易所内部字段（交易编码、交易所代码等），其余全部保留。
         """
         try:
             with open(txt_path, encoding="utf-8", errors="replace") as f:
                 raw = f.read()
         except Exception as e:
             return False, str(e)
-
         if not raw or len(raw) < 50:
             return False, "文件内容过短"
 
-        positions = []
         lines = raw.split('\n')
+        total = len(lines)
 
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('|---') or '-------' in line:
-                continue
-            # 去掉首尾|
-            if line.startswith('|'):
-                line = line[1:]
-            if line.endswith('|'):
-                line = line[:-1]
+        # ── 1. 资金状况 ──────────────────────────────────────────────
+        sec = self._find_section_header(lines, ('资金状况', 'Account Summary'))
+        account_summary = self._parse_account_summary(lines, sec or 0) if sec is not None else {}
 
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) < 9:
-                continue
+        # ── 2. 持仓明细（最细粒度，含 Settlement Price） ───────────────
+        pos_detail = []
+        sec = self._find_section_header(lines, ('持仓明细', 'Positions Detail'))
+        if sec is not None:
+            header_line = ''
+            data_start = sec + 3  # 跳过空行+分隔线
+            for i in range(sec, min(sec + 5, total)):
+                if lines[i].strip().startswith('|'):
+                    header_line = lines[i].strip()
+                    data_start = i + 2
+                    break
+            if header_line:
+                all_cols, col_map = self._parse_pipe_header(header_line)
+                for line in lines[data_start:]:
+                    row = self._parse_pipe_row(line, all_cols)
+                    if not row:
+                        continue
+                    # 提取合约代码（取英文 Instrument 列）
+                    sym = row.get('Instrument', row.get('合约', '')).strip()
+                    if not self._is_symbol(sym):
+                        continue
+                    # 提取结算价（Settlement Price）
+                    sttl_price = row.get('Settlement Price', row.get('结算价', ''))
+                    try:
+                        sttl_price = float(sttl_price) if sttl_price else 0.0
+                    except ValueError:
+                        sttl_price = 0.0
+                    # 提取开仓价
+                    open_price = row.get('Pos. Open Price', row.get('开仓价', ''))
+                    try:
+                        open_price = float(open_price) if open_price else 0.0
+                    except ValueError:
+                        open_price = 0.0
+                    # 提取昨结算（Prev. Sttl）
+                    prev_sttl = row.get('Prev. Sttl', row.get('昨结算', ''))
+                    try:
+                        prev_sttl = float(prev_sttl) if prev_sttl else 0.0
+                    except ValueError:
+                        prev_sttl = 0.0
+                    # 提取多空方向
+                    bs = row.get('B/S', row.get('买/卖', row.get('B/S ', ''))).strip()
+                    direction = _parse_direction(bs)
+                    # 提取持仓量
+                    vol_val = row.get('Positon', row.get('持仓量', ''))
+                    try:
+                        vol = int(float(vol_val)) if vol_val else 0
+                    except ValueError:
+                        vol = 0
+                    pos_detail.append({
+                        "instrument": sym,
+                        "direction": direction,
+                        "volume": vol,
+                        "open_price": open_price,
+                        "settlement_price": sttl_price,
+                        "prev_sttl_price": prev_sttl,
+                        "_raw": row,
+                    })
 
-            # 合约代码在第4列（index 3）
-            sym = parts[3]
-            if not (sym and len(sym) >= 3 and sym[0].isalpha() and any(c.isdigit() for c in sym)):
-                continue
+        # ── 3. 成交记录 ──────────────────────────────────────────────
+        tx_records = []
+        sec = self._find_section_header(lines, ('成交记录', 'Transaction Record'))
+        if sec is not None:
+            header_line = ''
+            data_start = sec + 3
+            for i in range(sec, min(sec + 5, total)):
+                if lines[i].strip().startswith('|'):
+                    header_line = lines[i].strip()
+                    data_start = i + 2
+                    break
+            if header_line:
+                all_cols, col_map = self._parse_pipe_header(header_line)
+                for line in lines[data_start:]:
+                    row = self._parse_pipe_row(line, all_cols)
+                    if not row:
+                        continue
+                    sym = row.get('Instrument', row.get('合约', '')).strip()
+                    if not self._is_symbol(sym):
+                        continue
+                    # 剔除交易编码（内部字段）
+                    clean_row = {k: v for k, v in row.items()
+                                 if k.lower() not in ('tradingcode', '交易编码')}
+                    tx_records.append({"_raw": clean_row})
 
-            try:
-                long_vol  = int(float(parts[4])) if parts[4].strip() else 0
-                avg_buy   = float(parts[5]) if parts[5].strip() else 0.0
-                short_vol = int(float(parts[6])) if parts[6].strip() else 0
-                avg_sell  = float(parts[7]) if parts[7].strip() else 0.0
-            except (ValueError, IndexError):
-                continue
+        # ── 4. 平仓明细 ──────────────────────────────────────────────
+        closed = []
+        sec = self._find_section_header(lines, ('平仓明细', 'Position Closed'))
+        if sec is not None:
+            header_line = ''
+            data_start = sec + 3
+            for i in range(sec, min(sec + 5, total)):
+                if lines[i].strip().startswith('|'):
+                    header_line = lines[i].strip()
+                    data_start = i + 2
+                    break
+            if header_line:
+                all_cols, col_map = self._parse_pipe_header(header_line)
+                for line in lines[data_start:]:
+                    row = self._parse_pipe_row(line, all_cols)
+                    if not row:
+                        continue
+                    sym = row.get('Instrument', row.get('合约', '')).strip()
+                    if not self._is_symbol(sym):
+                        continue
+                    clean_row = {k: v for k, v in row.items()
+                                 if k.lower() not in ('tradingcode', '交易编码')}
+                    closed.append({"_raw": clean_row})
 
-            if long_vol > 0 and avg_buy > 0:
-                positions.append({
-                    "instrument":     sym,
-                    "direction":      "多",
-                    "volume":         long_vol,
-                    "open_price":     avg_buy,
-                    "avg_buy_price":  avg_buy,
-                    "avg_sell_price": 0.0,
-                })
-            if short_vol > 0 and avg_sell > 0:
-                positions.append({
-                    "instrument":     sym,
-                    "direction":      "空",
-                    "volume":         short_vol,
-                    "open_price":     avg_sell,
-                    "avg_buy_price":  0.0,
-                    "avg_sell_price": avg_sell,
-                })
+        # ── 5. 行权明细（有则解析，无则空） ──────────────────────────
+        exercise = []
+        sec = self._find_section_header(lines, ('行权明细', 'Exercise Statement'))
+        if sec is not None:
+            header_line = ''
+            data_start = sec + 3
+            for i in range(sec, min(sec + 5, total)):
+                if lines[i].strip().startswith('|'):
+                    header_line = lines[i].strip()
+                    data_start = i + 2
+                    break
+            if header_line:
+                all_cols, col_map = self._parse_pipe_header(header_line)
+                for line in lines[data_start:]:
+                    row = self._parse_pipe_row(line, all_cols)
+                    if not row:
+                        continue
+                    sym = row.get('Instrument', row.get('合约', '')).strip()
+                    if not self._is_symbol(sym):
+                        continue
+                    clean_row = {k: v for k, v in row.items()
+                                 if k.lower() not in ('tradingcode', '交易编码')}
+                    exercise.append({"_raw": clean_row})
 
-        if not positions:
-            return False, f"未能从结算单提取到持仓数据（{len(lines)}行）"
+        if not pos_detail and not tx_records and not closed:
+            return False, f"未识别到任何持仓/成交/平仓表（{total}行）"
 
-        # 写入 full_*.json
+        # ── 写入 full_*.json ────────────────────────────────────────
         full_json = {
             "trading_date": trading_date,
-            "positions": positions,
-            "positions_summary": positions,
+            "account_summary": account_summary,
+            "positions_detail": pos_detail,
+            "transaction_records": tx_records,
+            "closed_positions": closed,
+            "exercise_records": exercise,
         }
         out_path = os.path.join(SETTLEMENT_DIR, f"full_{trading_date}.json")
         with open(out_path, 'w', encoding='utf-8') as f:
             json.dump(full_json, f, ensure_ascii=False, indent=2)
 
-        # 同步更新内存缓存
-        self._cost_cache = load_settlement_cost(full_json)
+        self._cost_cache  = load_settlement_cost(full_json)
+        self._price_cache = load_settlement_prices(full_json)
         return True, ""
 
     def _refresh_meta(self):

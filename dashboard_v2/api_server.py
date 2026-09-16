@@ -19,6 +19,19 @@ from typing import Optional
 
 from flask import Blueprint, Flask, jsonify, request
 
+def _clean_nan(obj):
+    """递归将 float('nan') / float('inf') 替换为 None，避免 JSON 序列化失败"""
+    if isinstance(obj, dict):
+        return {k: _clean_nan(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_clean_nan(v) for v in obj]
+    elif isinstance(obj, float):
+        import math
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    return obj
+
 # ── 项目内部 ─────────────────────────────────────────────────────────────────
 import sys as _sys
 import os as _os
@@ -47,7 +60,7 @@ _shared_state = {
     "underlying_prices": {},  # {symbol: price}
     "tree": [],               # list  树形结构
     "contracts": {},          # {symbol: contract_dict}  合约元数据（含 size/strike/days_to_expiry）
-    "settlement_dict": {},    # {sym_多: cost}           开仓加权成本
+    "settlement_dict": {},    # {symbol: net_cost}       净仓开仓均价
     "account": {},            # dict  账户信息
     "ctp_status": "disconnected",   # "disconnected" | "connecting" | "connected" | "error"
     "ctp_error": "",          # str   错误信息
@@ -98,6 +111,7 @@ def _snapshot():
             "underlying_prices": dict(_shared_state["underlying_prices"]),
             "contracts": dict(_shared_state["contracts"]),
             "settlement_dict": dict(_shared_state["settlement_dict"]),
+            "settlement_prices": dict(_shared_state.get("settlement_prices", {})),
             "summary": tree_obj.get("summary", {}),
             "tree": tree_obj.get("tree", []),
             "account": dict(_shared_state["account"]),
@@ -212,12 +226,37 @@ def _worker_loop(settlement_dir: str):
     """
     global _engine
 
+    global _settlement_manager
     cred = _ctp_credential.copy()
     if not cred.get("用户名") or not cred.get("密码"):
         _set_status("error", "缺少用户名或密码", alive=False)
         return
 
+    # 结算单管理器全程只创建一次（初始化时已加载本地数据，后续 sync 只做增量补充）
+    if _settlement_manager is None:
+        _settlement_manager = SettlementManager()
+        _settlement_manager.load_costs_from_meta()
+    _local_complete = (
+        len(_settlement_manager._cost_cache) > 0
+        and _settlement_manager._meta.get("loaded", False)
+    )
+
+    def _do_settlement_sync():
+        try:
+            # 本地数据齐全时，跳过网络请求
+            if _local_complete:
+                logger.info("[结算单] 本地数据已齐全，跳过 sync")
+                return
+            sync_result = _settlement_manager.sync()
+            logger.info(f"[结算单] sync_result={sync_result}")
+            # sync 成功后标记为完整
+            if sync_result.get("missing_filled") or sync_result.get("today_updated"):
+                _local_complete = True
+        except Exception as e:
+            logger.error(f"[结算单] sync 异常: {e}")
+
     attempts = 0
+    disconnect_retry_count = 0   # 记录连续掉线次数（用于自动重连上限）
     while not _ctp_stop_event.is_set():
         _set_status("connecting", None, alive=True)
         eng, err, retryable = _connect_engine(cred)
@@ -225,23 +264,12 @@ def _worker_loop(settlement_dir: str):
             # 连接成功
             _engine = eng
             attempts = 0
+            disconnect_retry_count = 0
             _set_status("connected", "")
 
-            # 连接成功 → 后台线程执行结算单增量同步（补缺漏 + 当天下载）
-            def _do_settlement_sync():
-                global _settlement_manager
-                try:
-                    if _settlement_manager is None:
-                        _settlement_manager = SettlementManager()
-                    sync_result = _settlement_manager.sync()
-                    logger.info(f"[结算单] sync_result={sync_result}")
-                except Exception as e:
-                    logger.error(f"[结算单] sync 异常: {e}")
-
+            # 后台线程：增量同步（补缺漏 + 当天下载）
             t = threading.Thread(target=_do_settlement_sync, daemon=True)
             t.start()
-
-            settlement_data = _fetch_settlement(settlement_dir)
 
             # 连接成功后立即主动查询持仓（不等 2 秒定时器）
             try:
@@ -254,13 +282,33 @@ def _worker_loop(settlement_dir: str):
                 if not _td_logged_in(eng):
                     # 掉线 → 丢弃旧引擎（不 close！CtpTdApi.exit() 持 GIL 阻塞会冻死
                     # 整个解释器），回外层走重连阶梯建新引擎。对齐旧版 _do_retry_loop。
-                    # ponytail: 旧引擎的 C++ 对象+线程泄漏一轮；若实测撞"已在别处登录"
-                    # 再改成退进程自愈。
-                    _set_status("connecting", "CTP 掉线，自动重连中")
-                    _engine = None
-                    break
+                    disconnect_retry_count += 1
+                    if disconnect_retry_count <= _RETRY_FAST_ATTEMPTS:
+                        _set_status("connecting",
+                                    f"CTP 掉线，第{disconnect_retry_count}/{_RETRY_FAST_ATTEMPTS}次重连中")
+                        _ctp_stop_event.wait(_RETRY_FAST_INTERVAL)
+                        # 重建引擎继续尝试
+                        eng, err, retryable = _connect_engine(cred)
+                        if eng is not None:
+                            _engine = eng
+                            attempts = 0
+                            disconnect_retry_count = 0
+                            _set_status("connected", "")
+                            continue
+                    else:
+                        # 10次重连均失败 → 通知前端弹窗，等用户手动处理
+                        _set_status("error",
+                                    f"CTP 连续掉线{disconnect_retry_count}次，请检查网络或重连",
+                                    alive=False)
+                        return
+                # 每次轮询都取最新结算数据（sync 线程可能已更新 _settlement_manager）
+                _settlement_manager.load_costs_from_meta()   # 确保缓存是最新的
+                settlement_data    = _settlement_manager.get_all_costs()
+                settlement_prices = _settlement_manager.get_all_prices()
+                if len(settlement_data) == 0:
+                    logger.warning(f"[结算单] settlement_data 为空！latest={_settlement_manager._meta.get('latest')}, cache={len(_settlement_manager._cost_cache)}")
                 try:
-                    _poll_once(eng, settlement_data)
+                    _poll_once(eng, settlement_data, settlement_prices)
                 except Exception:
                     logger.exception("[_poll_once] 异常")
                     import traceback
@@ -299,7 +347,7 @@ def _worker_loop(settlement_dir: str):
     _engine = None
 
 
-def _poll_once(engine: VNPYEngine, settlement_data: dict):
+def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dict):
     """单次轮询：读取持仓 → 订阅行情 → 计算 Greeks → 写共享状态"""
     global _engine
     _engine = engine
@@ -313,6 +361,7 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
     futures_positions = []
     underlying_set = set()
     by_underlying = defaultdict(list)
+    by_symbol = {}
 
     for pos in raw_positions:
         vt = pos.vt_symbol
@@ -585,12 +634,24 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
                 "days_to_expiry": days_to_expiry(expiry_str),
             }
 
-    # settlement_cost_dict 格式已对齐 calc_pnl（key: f"{sym}_多"/f"{sym}_空"，value: float）
-    settlement_cost_dict = settlement_data
+    settlement_cost_dict  = settlement_data
+    settlement_prices_dict = settlement_prices
 
     # ── 写共享状态 ────────────────────────────────────────────────────────────
     # build_tree 是纯函数，需要 ticks + contracts + settlement_dict
-    tree = build_tree(positions_out, ticks, contracts, settlement_cost_dict)
+    try:
+        tree = build_tree(positions_out, ticks, contracts,
+                          settlement_cost_dict, settlement_prices_dict)
+    except Exception:
+        import traceback
+        tree = {"summary": {}, "tree": []}
+        with open(_os.path.join(_parent_dir, "_poll_error.log"), "a") as f:
+            f.write(f"=== {datetime.datetime.now()} ===\n")
+            f.write(f"positions_out={len(positions_out)}\n")
+            f.write(f"contracts={len(contracts)}\n")
+            f.write(f"ticks={list(ticks.keys())[:10]}\n")
+            f.write(traceback.format_exc())
+            f.write("\n")
     logger.info(f"[_poll_once] positions_out={len(positions_out)}, contracts={len(contracts)}, tree_nodes={len(tree.get('tree',[]))}")
     with _shared_lock:
         _shared_state["positions"] = positions_out
@@ -598,6 +659,7 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict):
         _shared_state["tree"] = tree
         _shared_state["contracts"] = contracts
         _shared_state["settlement_dict"] = settlement_cost_dict
+        _shared_state["settlement_prices"] = settlement_prices_dict
         _shared_state["account"] = account_data
         _shared_state["last_update"] = datetime.datetime.now()
 
@@ -862,7 +924,7 @@ def api_snapshot_load():
 def api_dashboard():
     """返回完整看板快照（持仓树 + Greeks + 账户 + CTP状态）"""
     snap = _snapshot()
-    return jsonify({
+    payload = {
         "status": snap["ctp_status"],
         "error": snap["ctp_error"],
         "last_update": snap["last_update"],
@@ -873,7 +935,10 @@ def api_dashboard():
         "underlying_prices": snap["underlying_prices"],
         "account": snap["account"],
         "worker_alive": snap["worker_alive"],
-    })
+        "settlement_dict": snap["settlement_dict"],
+        "settlement_prices": snap["settlement_prices"],
+    }
+    return jsonify(_clean_nan(payload))
 
 
 @api_bp.route("/ctp/connect", methods=["POST"])
