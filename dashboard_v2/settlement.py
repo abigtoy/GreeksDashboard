@@ -14,6 +14,7 @@ import os
 import pathlib
 from datetime import date, datetime, timedelta
 from collections import defaultdict
+from loguru import logger
 
 # -----------------------------------------------------------------------
 # 方向映射表（兼容多种字段命名）
@@ -21,17 +22,18 @@ from collections import defaultdict
 _LONG_DIRS  = {'买', '多', 'B', '1', 'Buy', 'L', 'Long', 'long'}
 _SHORT_DIRS = {'卖', '空', 'S', '-1', 'Sell', 'S', 'Short', 'short'}
 
-def _parse_direction(raw: str) -> str:
+def _parse_direction(raw: str) -> str | None:
+    """
+    方向解析。返回 '多'、'空' 或 None（未知方向，拒绝入账）。
+    """
     if not raw:
-        return '空'
+        return None
     s = str(raw).strip()
     if s in _LONG_DIRS:
         return '多'
     if s in _SHORT_DIRS:
         return '空'
-    if s[0] in ('买', '多', 'B', 'L', '1'):
-        return '多'
-    return '空'
+    return None
 
 # -----------------------------------------------------------------------
 # 策略1：嗅探券商预计算汇总均价
@@ -52,13 +54,14 @@ def _net_aggregate(details: list, price_field: str) -> dict[str, float]:
         sym = item.get('instrument', '')
         if not sym:
             continue
-        direction = item.get('direction', '')
+        # 方向来源：优先用 direction 字段（positions_summary 场景），降级用 bs 字段（positions_detail 场景）
+        raw_dir = item.get('direction', '') or item.get('bs', '')
         price = float(item.get(price_field) or 0)
-        vol = int(item.get('volume') or 0)
+        vol = int(item.get('volume') or item.get('position') or 0)
         if price <= 0 or vol <= 0:
             continue
         a = agg[sym]
-        if direction == '多':
+        if raw_dir in ('多', '买', 'long', 'buy'):
             a["long_cost"] += price * vol
             a["long_vol"] += vol
         else:
@@ -75,26 +78,90 @@ def _net_aggregate(details: list, price_field: str) -> dict[str, float]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# 开仓均价 — 净仓聚合
-# ---------------------------------------------------------------------------
-def _load_cost_by_net_pos(settlement_json: dict) -> dict:
-    details = settlement_json.get('positions_detail') or []
-    return _net_aggregate(details, 'open_price')
-
-# 保留旧函数名（兼容）
-def _load_from_summary(settlement_json: dict) -> dict:
-    return _load_cost_by_net_pos(settlement_json)
-
-def _load_from_detail(settlement_json: dict) -> dict:
-    return _load_cost_by_net_pos(settlement_json)
-
+# --------------------------------------------------------------------------
+# 开仓均价 — 双策略（汇总优先，明细兜底）+ 方向后缀 key
+# --------------------------------------------------------------------------
 def load_settlement_cost(settlement_json: dict) -> dict:
     """
-    净仓聚合开仓均价。
-    返回: { "IC2612": 7434.44, "IC2609": 8048.6, ... }
+    净仓聚合开仓均价，key 带方向后缀 {sym}_{多|空}。
+    返回: { "IC2612_多": 7434.44, "IC2609_空": 8048.6, ... }
+
+    实际数据格式（CTP 结算单）：
+      - long_pos / avg_buy  → 多仓均价
+      - short_pos / avg_sell → 空仓均价
+      - bs（账户类别：交易/投机/保值）非方向字段
+      - 无 positions / positions_summary 预汇总
+
+    双策略优先级：
+      策略1（汇总）：positions / positions_summary 中的预计算均价（优先）
+      策略2（明细）：long_pos×avg_buy + short_pos×avg_sell 净仓自算（兜底）
+
+    差异告警：同一合约汇总 vs 明细价格差异超过 ±5% → warning 日志
+    未知方向拒绝入账：无法映射到'多'/'空'时拒绝，日志记录
     """
-    return _load_cost_by_net_pos(settlement_json)
+    settlement_dict: dict[str, float] = {}
+    detail_calc: dict[str, dict[str, float]] = defaultdict(lambda: {"total_cost": 0.0, "total_vol": 0})
+
+    # ========== 策略1: positions_summary 多空均价（无方向歧义）==========
+    summary_list = settlement_json.get('positions_summary') or []
+    for item in summary_list:
+        sym = (item.get('instrument') or '').strip()
+        if not sym:
+            continue
+
+        # 多仓
+        long_pos  = int(item.get('long_pos', 0) or 0)
+        avg_buy   = float(item.get('avg_buy', 0.0) or 0.0)
+        if long_pos > 0 and avg_buy > 0:
+            key = f"{sym}_多"
+            settlement_dict[key] = round(avg_buy, 4)
+
+        # 空仓
+        short_pos = int(item.get('short_pos', 0) or 0)
+        avg_sell  = float(item.get('avg_sell', 0.0) or 0.0)
+        if short_pos > 0 and avg_sell > 0:
+            key = f"{sym}_空"
+            settlement_dict[key] = round(avg_sell, 4)
+
+    # ========== 策略2: positions_detail 逐笔明细 VWAP 自算（兜底 + 差异告警）==========
+    details = settlement_json.get('positions_detail') or []
+    for item in details:
+        sym = (item.get('instrument') or '').strip()
+        if not sym:
+            continue
+
+        # 方向从 bs 字段取（买/卖）
+        raw_dir = str(item.get('bs') or '')
+        direction = _parse_direction(raw_dir)
+        if direction is None:
+            logger.warning(f"[结算单] 未知方向拒绝入账: bs={raw_dir!r}, sym={sym}")
+            continue
+
+        open_price = float(item.get('open_price') or 0.0)
+        position   = int(item.get('position') or item.get('vol') or item.get('volume') or 0)
+        if open_price <= 0 or position <= 0:
+            continue
+
+        key = f"{sym}_{direction}"
+        if key in settlement_dict:
+            # 差异告警
+            delta = abs(open_price - settlement_dict[key]) / max(settlement_dict[key], 1e-9)
+            if delta > 0.05:
+                logger.warning(
+                    f"[结算单] 汇总/明细差异 >5%: {sym} {direction} "
+                    f"汇总={settlement_dict[key]:.4f} 明细={open_price:.4f} 差异={delta*100:.1f}%"
+                )
+        else:
+            # 策略2 兜底（明细优先）
+            detail_calc[key]["total_cost"] += open_price * position
+            detail_calc[key]["total_vol"]  += position
+
+    # 策略2 自算 VWAP 回填（兜底 keys）
+    for key, data in detail_calc.items():
+        if data["total_vol"] > 0:
+            settlement_dict[key] = round(data["total_cost"] / data["total_vol"], 4)
+
+    return settlement_dict
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +174,7 @@ def load_settlement_prices(settlement_json: dict) -> dict:
     返回: { "IC2612": 7347.4, "IC2609": 7565.0, ... }
     """
     details = settlement_json.get('positions_detail') or []
-    return _net_aggregate(details, 'settlement_price')
+    return _net_aggregate(details, 'settl_price')
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +207,9 @@ def load_settlement_sync(dir_path: str) -> dict:
 # =======================================================================
 # SettlementManager — 状态管理器（增量同步 + 日期标记）
 # =======================================================================
-SETTLEMENT_DIR   = r"C:\Quant_2026\期货执行策略\GreeksDashboard_v0.1\结算单"
+SETTLEMENT_DIR   = os.path.abspath(
+    os.path.join(os.path.realpath(os.path.dirname(os.path.dirname(__file__))),
+                 "..", "vnpy接口封装", "结算单"))
 META_FILE        = os.path.join(SETTLEMENT_DIR, "settlement_meta.json")
 LOOKBACK_DAYS    = 30          # 每次补缺漏扫描近 N 天
 
@@ -295,10 +364,20 @@ class SettlementManager:
         """
         根据 meta.latest 加载对应 full_*.json 到内存缓存。
         启动时调用（CTP 断线重连后不重新下载，直接用已入库数据）。
+        若 meta.latest 不存在（首次运行/ meta 文件丢失），自动扫描最新 full_*.json 兜底。
         """
         latest = self._meta.get("latest")
         if not latest:
-            return
+            # 兜底：扫描最新入库结算单
+            import glob
+            files = sorted(glob.glob(os.path.join(SETTLEMENT_DIR, "full_*.json")))
+            if files:
+                latest_path = files[-1]
+                latest = os.path.splitext(os.path.basename(latest_path))[0].replace("full_", "")
+                self._meta["latest"] = latest
+                logger.info(f"[SettlementManager] meta.latest 为空，已自动推断: {latest}")
+            else:
+                return
         path = os.path.join(SETTLEMENT_DIR, f"full_{latest}.json")
         if not os.path.exists(path):
             return
@@ -307,6 +386,7 @@ class SettlementManager:
                 data = json.load(f)
             self._cost_cache  = load_settlement_cost(data)
             self._price_cache = load_settlement_prices(data)
+            logger.info(f"[SettlementManager] 加载结算单 full_{latest}.json，_price_cache {len(self._price_cache)} 条，_cost_cache {len(self._cost_cache)} 条")
         except Exception:
             pass
 

@@ -199,7 +199,7 @@ def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
         "pos_delta": pos_delta, "pos_gamma": pos_gamma,
         "pos_vega":  pos_vega,  "pos_theta": pos_theta,
         "deltacash": round(pos_delta * F * size),
-        "gammacash": round(pos_gamma * (F ** 2) * 0.01 * 0.01 * size),  # 1% 标的变动
+        "gammacash": round(pos_gamma * (F ** 2) * 0.01 * size),  # 1% 标的变动
         "vegacash":  round(pos_vega  * size),
         "thetacash": round(pos_theta * size),
     }
@@ -223,8 +223,8 @@ def calc_pnl(position: dict, contract: dict, tick: dict,
     if vol == 0:
         return {"pnl_daily": 0.0, "pnl_today": 0.0, "pnl_history": 0.0}
 
-    # 真实开仓成本
-    cost_price = settlement_dict.get(sym, position.get('price', 0.0))
+    # 真实开仓成本（key 带方向后缀：IF2609_多 / IF2609_空）
+    cost_price = settlement_dict.get(f"{sym}_{direction_str}", position.get('price', 0.0))
     # 新开仓（昨价为空）时用开仓价作基准，防止 pnl_today = 0
     if cost_price == 0.0:
         cost_price = position.get('price', 0.0)
@@ -259,9 +259,10 @@ def calc_pnl(position: dict, contract: dict, tick: dict,
     if base_today is None:
         import math
         base_today = math.nan
-    pnl_today = (direction_sign * (adj_price - base_today) * vol * size
-                 if not (isinstance(base_today, float) and base_today != base_today)
-                 else math.nan)
+    if isinstance(base_today, float) and base_today != base_today:  # NaN check
+        pnl_today = math.nan
+    else:
+        pnl_today = direction_sign * (adj_price - base_today) * vol * size
 
     return {
         "pnl_daily":   round(pnl_daily,   2),

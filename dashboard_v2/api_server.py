@@ -94,7 +94,21 @@ _ctp_credential = {}       # 中文键 dict，直接作为 VNPYEngine.cctp_setti
 _ctp_stop_event = threading.Event()
 _worker_thread: Optional[threading.Thread] = None
 
-# ── 工具函数 ────────────────────────────────────────────────────────────────
+# ── P0-2/3/5: CTP 成交回报账本（进程内，重启丢失）─────────────────────────────
+# 分组键：不含 offset（同一持仓方向的开仓和平仓记录共同参与 PnL 计算）
+# _trade_cache: dict[ledger_key_tuple, list[trade_record]]
+# ledger_key = (trading_day, account, exchange, symbol, position_direction)
+_TRADE_CACHE: dict = {}
+_SEEN_TRADE_IDS: set = set()   # 幂等去重：(trading_day, account, exchange, trade_id)
+
+# ── P0-6: 已实现 PnL 实时累加通道 ─────────────────────────────────────────────
+# 全平合约从持仓 tree 消失，但其 realized PnL 必须进入当日和历史汇总
+_REALIZED_PNL_CACHE: dict[str, float] = {}   # key = symbol, value = 累计 realized PnL
+
+# ── P0-8: 开盘合约标记（事件驱动：收到 tick 即标记）────────────────────────────
+_OPENED_CONTRACTS: dict[str, dict] = {}  # key = symbol, value = {first_tick: "HH:MM:SS"}
+
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
 
 def _now_str():
     return datetime.datetime.now().strftime("%H:%M:%S")
@@ -216,6 +230,123 @@ def _connect_engine(cred: dict):
     return None, "无法连接服务器（检查交易/行情服务器地址、端口与网络）", True
 
 
+# ── P0-2/3/5: CTP 成交回报回调 ─────────────────────────────────────────────
+def _on_trade(trade) -> None:
+    """
+    CTP 成交通知回调（P0-2/3/5 账本模型 + P0-6 realized_pnl）。
+
+    幂等去重：同一 (trading_day, account, exchange, trade_id) 只处理一次。
+    账本分组：ledger_key = (trading_day, account, exchange, symbol, position_direction)
+    方向守恒：同一分组内的开仓/平仓记录共同参与 PnL 计算。
+
+    归因优先级：
+      1. CTP 原生 offset_flag（open / close_today / close_yesterday）
+      2. 降级推断（无 offset_flag 时）：由 open_close 推断，并标注 allocation_source="fifo_fallback"
+    """
+    try:
+        trading_day = getattr(trade, 'datetime', '')[:10] if getattr(trade, 'datetime', '') else ''
+        if not trading_day:
+            trading_day = datetime.datetime.now().strftime('%Y%m%d')
+        account  = getattr(trade, 'gateway_name', '') or ''
+        exchange = getattr(trade, 'exchange', '') or ''
+        if hasattr(trade, 'exchange') and hasattr(trade.exchange, 'value'):
+            exchange = trade.exchange.value
+        trade_id = getattr(trade, 'tradeid', '') or ''
+    except Exception:
+        return
+
+    dedup_key = (trading_day, account, exchange, trade_id)
+    if dedup_key in _SEEN_TRADE_IDS:
+        return
+    _SEEN_TRADE_IDS.add(dedup_key)
+
+    try:
+        symbol = getattr(trade, 'symbol', '') or ''
+        if '.' in symbol:
+            symbol = symbol.split('.')[0]
+        raw_dir = str(getattr(trade, 'direction', '') or '')
+        position_direction = '多' if raw_dir in ('long', 'long', 'Long', '多', '买', 'B', '1', 'Buy') else '空'
+
+        # offset_flag：优先取 CTP 原生字段
+        offset_flag = ''
+        allocation_source = 'ctp_offset'
+        raw_offset = getattr(trade, 'offset', '') or ''
+        if hasattr(raw_offset, 'value'):
+            raw_offset = raw_offset.value
+        if raw_offset in ('开', 'OPEN', 'open', 'Open'):
+            offset_flag = 'open'
+        elif raw_offset in ('平今', 'CLOSETODAY', 'close_today', 'CloseToday'):
+            offset_flag = 'close_today'
+        elif raw_offset in ('平昨', 'CLOSEYESTERDAY', 'close_yesterday', 'CloseYesterday'):
+            offset_flag = 'close_yesterday'
+        elif raw_offset in ('平', 'CLOSE', 'close', 'Close'):
+            offset_flag = 'close_yesterday'
+        else:
+            # 降级推断
+            allocation_source = 'fifo_fallback'
+            is_open = getattr(trade, 'is_open', False)
+            offset_flag = 'open' if is_open else 'close_yesterday'
+
+        price = float(getattr(trade, 'price', 0) or 0)
+        volume = int(getattr(trade, 'volume', 0) or 0)
+
+        record = {
+            'dedup_key': f"{trading_day}_{account}_{exchange}_{trade_id}",
+            'ledger_key': [trading_day, account, exchange, symbol, position_direction],
+            'trade_id': trade_id,
+            'symbol': symbol,
+            'direction': raw_dir,
+            'position_direction': position_direction,
+            'open_close': '开' if offset_flag == 'open' else '平',
+            'offset_flag': offset_flag,
+            'allocation_source': allocation_source,
+            'price': price,
+            'volume': volume,
+            'trade_time': getattr(trade, 'datetime', '') or '',
+            'account': account,
+            'exchange': exchange,
+            'trading_day': trading_day,
+        }
+        ledger_key = tuple(record['ledger_key'])
+        _TRADE_CACHE.setdefault(ledger_key, []).append(record)
+
+        # P0-6: 平仓时计算 realized PnL 并累加
+        if offset_flag != 'open' and price > 0 and volume > 0:
+            direction_sign = 1 if position_direction == '多' else -1
+            sym = symbol
+            # cost_price 从 _shared_state["settlement_dict"] 读取（key 带方向）
+            with _shared_lock:
+                cost_dict = dict(_shared_state.get('settlement_dict', {}))
+            cost_key = f"{sym}_{position_direction}"
+            cost_price = cost_dict.get(cost_key, price)  # 降级用成交价
+            # 估算 size（从 _shared_state 的 contracts 获取）
+            size = 1
+            try:
+                with _shared_lock:
+                    c = _shared_state.get('contracts', {})
+                    if sym in c:
+                        size = c[sym].get('size', 1)
+            except Exception:
+                pass
+            pnl_realized = direction_sign * (price - cost_price) * volume * size
+            _REALIZED_PNL_CACHE[sym] = _REALIZED_PNL_CACHE.get(sym, 0.0) + pnl_realized
+            logger.debug(f"[_on_trade] realized pnl {sym}: {pnl_realized:.2f}, running total: {_REALIZED_PNL_CACHE[sym]:.2f}")
+
+    except Exception:
+        logger.exception("[_on_trade] 处理成交回报异常")
+
+
+# ── P0-2: EVENT_TRADE 注册（在 engine 连接成功后调用）──────────────────────────
+def _register_trade_event(eng: VNPYEngine):
+    """将 _on_trade 注册到 vnpy 事件引擎。"""
+    try:
+        from vnpy.trader.event import EVENT_TRADE
+        eng.event_engine.register(EVENT_TRADE, _on_trade)
+        logger.info("[_register_trade_event] EVENT_TRADE 注册成功")
+    except Exception as e:
+        logger.warning(f"[_register_trade_event] EVENT_TRADE 注册失败: {e}")
+
+
 def _worker_loop(settlement_dir: str):
     """
     CTP Worker 主循环（连接 + 重连阶梯 + 轮询 + 自动快照）：
@@ -224,6 +355,21 @@ def _worker_loop(settlement_dir: str):
     - 自动快照只在内层 _poll_once 成功后调 _maybe_auto_save()（内部还有 ctp_status==connected 守卫）。
       重连与快照解耦：本模块只负责让 engine 活着，快照只读 ctp_status 作数据边界。
     """
+
+    # === 时间守卫：非交易时段休眠，不建任何会话 ===
+    now = datetime.datetime.now()
+    weekday = now.weekday()   # Mon=0, Sun=6
+    cur_min = now.hour * 60 + now.minute
+    is_trading = weekday < 5   # 周一到周五
+
+    if is_trading and 4 * 60 <= cur_min < 8 * 60 + 20:   # 04:00–08:20
+        wake = now.replace(hour=8, minute=20, second=0, microsecond=0)
+        if wake <= now:   # 已是20:00以后，08:20是"今天"已过
+            wake += datetime.timedelta(days=1)
+        nap = (wake - now).total_seconds()
+        logger.info(f"[时间守卫] 非交易时段，休眠 {nap/60:.0f} 分钟，至 {wake.strftime('%H:%M')}")
+        time.sleep(nap)
+
     global _engine
 
     global _settlement_manager
@@ -258,6 +404,19 @@ def _worker_loop(settlement_dir: str):
     attempts = 0
     disconnect_retry_count = 0   # 记录连续掉线次数（用于自动重连上限）
     while not _ctp_stop_event.is_set():
+        # 时间守卫：交易日前夜 04:00–08:20 不连接
+        now = datetime.datetime.now()
+        weekday = now.weekday()
+        cur_min = now.hour * 60 + now.minute
+        if weekday < 5 and 4 * 60 <= cur_min < 8 * 60 + 20:
+            wake = now.replace(hour=8, minute=20, second=0, microsecond=0)
+            if wake <= now:
+                wake += datetime.timedelta(days=1)
+            nap = (wake - now).total_seconds()
+            logger.info(f"[时间守卫] 非交易时段，休眠 {nap/60:.0f} 分钟，至 {wake.strftime('%H:%M')}")
+            time.sleep(nap)
+            continue   # 重新循环检查连接状态
+
         _set_status("connecting", None, alive=True)
         eng, err, retryable = _connect_engine(cred)
         if eng is not None:
@@ -266,6 +425,9 @@ def _worker_loop(settlement_dir: str):
             attempts = 0
             disconnect_retry_count = 0
             _set_status("connected", "")
+
+            # P0-2: 注册 CTP 成交通知回调
+            _register_trade_event(eng)
 
             # 后台线程：增量同步（补缺漏 + 当天下载）
             t = threading.Thread(target=_do_settlement_sync, daemon=True)
@@ -294,6 +456,9 @@ def _worker_loop(settlement_dir: str):
                             attempts = 0
                             disconnect_retry_count = 0
                             _set_status("connected", "")
+
+                            # P0-2: 重连后重新注册 CTP 成交通知回调
+                            _register_trade_event(eng)
                             continue
                     else:
                         # 10次重连均失败 → 通知前端弹窗，等用户手动处理
@@ -464,6 +629,12 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         for pos, contract in pos_list:
             tick = engine.query_tick(pos.vt_symbol, timeout=None)
             if tick and tick.last_price != 0:
+                # P0-8: 事件驱动开盘标记（收到 tick = 开盘）
+                sym = pos.vt_symbol.split('.')[0]
+                if sym not in _OPENED_CONTRACTS:
+                    ts = getattr(tick, 'datetime', None)
+                    ts_str = str(ts)[11:19] if ts else datetime.datetime.now().strftime('%H:%M:%S')
+                    _OPENED_CONTRACTS[sym] = {'first_tick': ts_str}
                 option_ticks[pos.vt_symbol] = {
                     "last_price":   tick.last_price,
                     "bid_price_1":  getattr(tick, "bid_price_1", 0) or 0,
@@ -637,11 +808,36 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
     settlement_cost_dict  = settlement_data
     settlement_prices_dict = settlement_prices
 
+    # ── settlement_cost_dict 方向 key 统一为英文（calc_pnl 用英文 key 查找）───────
+    _DIR_MAP_CN_TO_EN = {"多": "long", "空": "short"}
+    settlement_cost_dict_en = {}
+    for key, value in settlement_cost_dict.items():
+        # key 格式: "IC2609_多" / "IC2609_空" / "IC2609"（无方向后缀）
+        parts = key.rsplit('_', 1)
+        if len(parts) == 2 and parts[1] in _DIR_MAP_CN_TO_EN:
+            sym, direction_cn = parts
+            direction_en = _DIR_MAP_CN_TO_EN[direction_cn]
+            settlement_cost_dict_en[f"{sym}_{direction_en}"] = value
+        else:
+            settlement_cost_dict_en[key] = value  # 无方向后缀的原样保留
+
+    # ── 加载昨快照（adjust_price）──────────────────────────────────────────────
+    # calc_pnl 期望格式: {f"{sym}_{direction}": {"adjust_price": float}}
+    # 方向: settlement_cost_dict 用中文("多"/"空")，calc_pnl 用英文("long"/"short")
+    # 昨快照 direction 是中文，需转英文与 calc_pnl 查找格式对齐
+    raw_yesterday = _load_yesterday_snapshot()
+    yesterday_snapshot = {}
+    _DIR_MAP = {"多": "long", "空": "short"}
+    for (sym, direction_cn), adj_price in raw_yesterday.items():
+        direction_en = _DIR_MAP.get(direction_cn, direction_cn)
+        yesterday_snapshot[f"{sym}_{direction_en}"] = {"adjust_price": adj_price}
+
     # ── 写共享状态 ────────────────────────────────────────────────────────────
     # build_tree 是纯函数，需要 ticks + contracts + settlement_dict
     try:
         tree = build_tree(positions_out, ticks, contracts,
-                          settlement_cost_dict, settlement_prices_dict)
+                          settlement_cost_dict, settlement_prices_dict,
+                          yesterday_snapshot)
     except Exception:
         import traceback
         tree = {"summary": {}, "tree": []}
@@ -652,7 +848,25 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             f.write(f"ticks={list(ticks.keys())[:10]}\n")
             f.write(traceback.format_exc())
             f.write("\n")
-    logger.info(f"[_poll_once] positions_out={len(positions_out)}, contracts={len(contracts)}, tree_nodes={len(tree.get('tree',[]))}")
+    logger.info(f"[_poll_once] positions_out={len(positions_out)}, contracts={len(contracts)}, tree_nodes={len(tree.get('tree',[]))}, yesterday_snapshot_keys={len(yesterday_snapshot)}, settlement_prices_keys={len(settlement_prices_dict)}")
+    with open(_os.path.join(_parent_dir, "_debug_pnl.log"), "a") as f:
+        f.write(f"=== {datetime.datetime.now()} ===\n")
+        f.write(f"yesterday_snapshot count={len(yesterday_snapshot)}\n")
+        # 检查 au2610P904_short 的 lookup
+        test_key = "au2610P904_short"
+        f.write(f"  yesterday_snapshot['{test_key}'] = {yesterday_snapshot.get(test_key)}\n")
+        # 检查 settlement_prices 是否有标的
+        f.write(f"  settlement_prices count={len(settlement_prices_dict)}\n")
+
+    # P0-6: 汇总已实现 PnL（_realized_pnl_cache）追加到 summary
+    # 全平合约从 tree 消失，但其 realized PnL 必须进入当日和历史汇总
+    total_realized = sum(_REALIZED_PNL_CACHE.values())
+    if total_realized != 0:
+        if tree.get("summary"):
+            tree["summary"]["pnl_today"] = round(tree["summary"].get("pnl_today", 0) + total_realized, 2)
+            tree["summary"]["pnl_history"] = round(tree["summary"].get("pnl_history", 0) + total_realized, 2)
+        logger.debug(f"[_poll_once] realized_pnl accumulated: {total_realized:.2f}")
+
     with _shared_lock:
         _shared_state["positions"] = positions_out
         _shared_state["underlying_prices"] = underlying_prices
@@ -744,6 +958,54 @@ def _ensure_snapshot_dir():
     _os.makedirs(_SNAPSHOT_DIR, exist_ok=True)
 
 
+def _load_yesterday_snapshot() -> dict:
+    """
+    加载前一交易日尾盘快照，提取叶子合约的 adjust_price。
+    返回 {(symbol, direction): adjust_price} 字典。
+    快照 tree 为嵌套结构，叶子节点含 adjust_price 和 direction（中文"多"/"空"）。
+    """
+    today = datetime.datetime.now()
+    yesterday = today - datetime.timedelta(days=1)
+    filename = f"data_snapshot_{yesterday.strftime('%Y%m%d')}_P.json"
+    filepath = _snapshot_path(filename)
+
+    if not _os.path.isfile(filepath):
+        logger.warning(f"[_load_yesterday_snapshot] 快照不存在: {filepath}")
+        return {}
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning(f"[_load_yesterday_snapshot] 读文件失败: {e}")
+        return {}
+
+    result = {}
+
+    def extract_leaves(nodes):
+        for node in nodes:
+            children = node.get("children")
+            if children:
+                extract_leaves(children)
+            else:
+                sym = node.get("symbol")
+                if not sym:
+                    continue
+                direction_cn = node.get("direction", "")
+                # 快照叶子节点 direction 为中文 "多"/"空"，需与 settlement_cost_dict key 格式保持一致
+                if direction_cn in ("多", "空"):
+                    direction = direction_cn  # 中文原样，不转英文
+                else:
+                    continue
+                adj_price = node.get("adjust_price")
+                if adj_price is not None:
+                    result[(sym, direction)] = adj_price
+
+    extract_leaves(data.get("computed", {}).get("tree", []))
+    logger.info(f"[_load_yesterday_snapshot] 从 {filename} 提取 {len(result)} 条 adjust_price")
+    return result
+
+
 # ── 自动快照模块（与重连模块解耦：只读 _shared_state["ctp_status"] 作数据边界）──
 # 触发：connected 且（时段边界 或 距上次满 30min）
 # 落盘：positions hash 与旧文件不同才覆盖；时段边界强制覆盖；连接中的真空仓亦存
@@ -799,6 +1061,7 @@ def _maybe_auto_save():
         "trading_date": business_date,
         "session": session,
         "ctp_status": snap["ctp_status"],
+        "snapshot_kind": "empty" if not positions else "live",  # P0-8
         "data_hash": data_hash,
         "raw": {
             "positions": positions,
@@ -1158,11 +1421,12 @@ def create_app(settlement_dir: str = "结算单", static_folder=None, template_f
         template_folder: 模板目录（默认 dashboard_v2/templates）
     """
     # 推算项目根目录（api_server.py → dashboard_v2 → 项目根目录）
-    _project_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    _parent_dir = _os.path.dirname(_os.path.abspath(__file__))   # dashboard_v2
+    _project_root = _os.path.dirname(_parent_dir)                # C:/qproj
     if static_folder is None:
-        static_folder = _os.path.join(_project_root, "dashboard_v2", "static")
+        static_folder = _os.path.join(_project_root, "static")
     if template_folder is None:
-        template_folder = _os.path.join(_project_root, "dashboard_v2", "templates")
+        template_folder = _os.path.join(_project_root, "templates")
 
     app = Flask(__name__, static_folder=static_folder, template_folder=template_folder)
 

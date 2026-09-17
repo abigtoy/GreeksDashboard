@@ -1,10 +1,19 @@
 # VolTrading Dashboard — 设计基线（Baseline）
 
-> **基线版本**：v1.2-baseline
+> **基线版本**：v1.3-baseline
 > **建立日期**：2026-09-11
-> **最后更新**：2026-09-14 下午（结算单链路修复：SettlementManager + TradingDay 字段名修复）
-> **状态**：审查基线（v1.0 审查 + 2026-09-14 实现修正后的更新基准）
+> **最后更新**：2026-09-17（PnL 增强版合并 + 审查意见逐条修正）
+> **状态**：审查后修订（本次修正 P0-1~10 / P1-1~12 / P2-1~4 共 26 条问题）
 > **用途**：作为后续重构的唯一权威参考。本文档已吸收《Dashboard_重构设计.md》v4 的全部内容，并合并了旧版 `DESIGN.md` 中缺失的 IV 链路与 adjust_price 逻辑，同时标注了命名统一修正与已知缺口。
+>
+> **v1.3 更新说明（2026-09-17）**：
+> - P0-1~10 / P1-1~12 / P2-1~4 共 26 条审查问题逐条修正，详见审查意见 `审查意见260917.md`
+> - 3.7 PnL 公式重写（补全 direction_sign、守恒逻辑、已实现通道）
+> - 3.5 标记 DEPRECATED（仅保留签名，删除正文）
+> - trade_cache 账本模型重定义（分组键/去重键/OffsetFlag 归因）
+> - 结算成本双策略优先级修正（汇总为主，明细兜底）
+> - 快照原子写 + 空仓规范落盘 + TradingDay 绑定
+> - B1/B2 状态修正为"修复中/待数值验证"
 >
 > **v1.2 更新说明（2026-09-14 下午）**：
 > - G2 结算单链路全面升级：SettlementManager（增量同步 + 日期标记 + CTP 下载）
@@ -90,7 +99,7 @@ settlement_cost_dict = {
 }
 ```
 
-### 2.2 双策略加载（严禁单条直接覆写）
+### 2.2 双策略加载（汇总优先，明细兜底）
 
 ```python
 from collections import defaultdict
@@ -98,7 +107,7 @@ from collections import defaultdict
 def load_settlement_cost(settlement_json: dict) -> dict:
     settlement_dict = {}
 
-    # ========== 策略1: 嗅探券商预计算的汇总均价 ==========
+    # ========== 策略1: 嗅探券商预计算的汇总均价（优先）==========
     summary_list = (
         settlement_json.get('positions')
         or settlement_json.get('positions_summary')
@@ -115,7 +124,7 @@ def load_settlement_cost(settlement_json: dict) -> dict:
         if sym and vwap and float(vwap) > 0:
             settlement_dict[f"{sym}_{direction}"] = round(float(vwap), 4)
 
-    # ========== 策略2: 逐笔明细加权自算兜底 ==========
+    # ========== 策略2: 逐笔明细加权自算兜底（仅填充策略1未覆盖的 key）==========
     details = settlement_json.get('positions_detail') or []
     detail_calc = defaultdict(lambda: {"total_cost": 0.0, "total_vol": 0})
 
@@ -131,8 +140,10 @@ def load_settlement_cost(settlement_json: dict) -> dict:
             p, v = float(price), int(vol)
             if p > 0 and v > 0:
                 key = f"{sym}_{direction}"
-                detail_calc[key]["total_cost"] += p * v
-                detail_calc[key]["total_vol"] += v
+                # 仅当策略1未写入时才自算兜底（严禁直接覆写）
+                if key not in settlement_dict:
+                    detail_calc[key]["total_cost"] += p * v
+                    detail_calc[key]["total_vol"] += v
         except (ValueError, TypeError):
             continue
 
@@ -143,7 +154,16 @@ def load_settlement_cost(settlement_json: dict) -> dict:
     return settlement_dict
 ```
 
+> ⚠️ **严禁单条直接覆写**：策略2仅填充策略1未覆盖的 key；策略1已存在的 key **不被策略2覆写**。两个策略的结果差异应产生告警。
+
 **方向映射**：`'买'/'多'/'B'/'1'/'Buy'` → `'多'`；其余 → `'空'`
+
+> ⚠️ **未知方向拒绝入账**：方向字段无法映射到 `'多'` 或 `'空'` 时（如空字符串、未知值），该条记录**拒绝入账**，不降级不兜底，并记录告警日志。严禁将其归入任意方向。
+>
+> **汇总/明细优先级**：
+> 1. 汇总（`positions_summary`/`positions`）**优先**：若有汇总数据，直接使用汇总均价
+> 2. 明细（`positions_detail`）**兜底**：仅在汇总缺失该合约时，才用明细 VWAP 自算
+> 3. 若汇总与明细的同一合约价格差异超过 ±5%，记录差异告警（`warning: settlement_summary_detail_mismatch`）
 
 > ✅ **基线缺口 G2（已 FIXED）**：原 `load_settlement_sync` 扫 `parsed_*.json`，现升级为 `SettlementManager` 类，实现增量同步（补近30天缺漏 + 当天结算单自动下载）、日期标记（`settlement_meta.json`）、以及 CTP 下载→txt→`full_*.json` 全链路。详见 §二（新）。
 
@@ -240,7 +260,7 @@ CTP struct 实际字段名    : {"TradingDay": "20260909"}
 
 ### 3.2 adjust_price 与 IV 计算（盘中实时，与结算单完全解耦）
 
-#### adjust_price 三级规则（来源：旧版 DESIGN.md §四.5，当前代码仅为占位，见缺口 G3）
+#### adjust_price 四级规则（来源：旧版 DESIGN.md §四.5，当前代码仅为占位，见缺口 G3）
 
 1. **正常流动性合约**：mid_price 或 last_price
 2. **深度实值（ITM）**：PCP 平价公式 + OTM 腿时间价值反推
@@ -255,9 +275,33 @@ CTP struct 实际字段名    : {"TradingDay": "20260909"}
 3. 将反推得到的 IV 写入 tick['iv']，作为 calc_greeks 的输入
 4. 兜底：bisection 未收敛（NaN/不收敛）→ 同到期日 ATM IV 中位数；
          结果 > 500% → 直接截到 500%
+         结果 < 1%  → 直接截到 1%
 ```
 
-> **命名统一修正 C1**：设计文档 v4 §3.5 使用 `contract['ttm']`，但 `pricing.py` 与 `api_server.py` 均使用 `days_to_expiry`。本基线统一为 **`days_to_expiry`**，`calc_greeks` 内 `T = max(days_to_expiry / 365.0, 0.5/250.0)`。
+##### IV 反推输入校验
+
+```
+输入 price 必须满足理论上下界（否则直接拒绝反推）：
+
+  Call: max(F - K * exp(-rT), 0) ≤ price ≤ F * exp(-rT)  （上限取指数近似）
+  Put:  max(K * exp(-rT) - F, 0) ≤ price ≤ K * exp(-rT)
+
+bid/ask 校验：
+  - mid_price 反推前：检查 bid > 0 且 ask > mid_price，且 ask - bid 不超过合理阈值（如标的价的 10%）
+  - 若 bid/ask 价差不合理（如超过标的价 50%），跳过该腿，标注 iv_source='invalid_spread'
+  - 反推结果记录来源：iv_source 字段 = 'adjust_price' | 'atm_median' | 'invalid_spread' | 'nan_result'
+```
+
+##### ATM IV 回退（标注 iv_source）
+
+```
+当 bisection 返回 NaN 或超出 [0.01, 5.0] 时：
+  1. 取同到期日所有合约的 IV 中位数作为 ATM IV
+  2. 标注 iv_source = 'atm_median'
+  3. 记录日志：f"IV 反推失败 {sym}，回退 ATM IV={atm_iv:.4f}"
+```
+
+> **命名统一修正 C1**：设计文档 v4 §3.5 使用 `contract['ttm']`，但 `pricing.py` 与 `api_server.py` 均使用 `days_to_expiry`。本基线统一为 **`days_to_expiry`**，所有 T 计算统一使用自然日：`T = max(days_to_expiry / 365.0, 0.5/365.0)`。
 
 ### 3.3 标准 Black-76 与 IV 反推纯函数
 
@@ -282,9 +326,15 @@ import math
 from scipy.stats import norm
 
 def black76(IV: float, F: float, K: float, T: float, r: float = 0.02, cp: int = 1):
-    """Black-76 模型单张 Greeks 计算。cp: 1=Call, -1=Put。T: 最小截断 0.5/365。"""
-    T = max(T, 0.5 / 365.0)
-    v = IV / 100.0 if IV > 1.0 else max(IV, 0.001)
+    """Black-76 模型单张 Greeks 计算。cp: 1=Call, -1=Put。T: 最小截断 0.5/365。
+    
+    IV 输入单位：VNpy 直接返回小数形式（如 0.165 表示 16.5%），非百分比。
+    若发现 IV > 1.0，说明数据源返回了百分比形式，此时除以 100 归一化，并记录一次警告日志。
+    """
+    # IV 单位归一化
+    if IV > 1.0:
+        IV = IV / 100.0  # 百分比形式归一化为小数
+    v = max(IV, 0.001)
     sqrtT = math.sqrt(T)
     d1 = (math.log(F / K) + 0.5 * v * v * T) / (v * sqrtT)
     d2 = d1 - v * sqrtT
@@ -340,6 +390,13 @@ def implied_vol_bisection(price: float, F: float, K: float, T: float,
 
 #### 3.4.2 calc_greeks 参考实现
 
+> ⚠️ **纯函数红线**：`risk_engine.py` / `pricing.py` 中的所有计算函数（`calc_greeks` / `black76` / `implied_vol_bisection` / `calc_pnl` / `calc_adjust_price`）**禁止调用任何外部I/O**，包括但不限于：
+> - `engine.query_tick()` — 严格禁止，计算所需数据全部由 Worker 层从 `ticks` 字典显式传入
+> - `requests`、`open`、`socket` 等 I/O 调用
+> - 违反此约束会导致 Worker 线程阻塞、报价延迟累计、死锁等严重问题
+
+> **数据传入约定**：标的期货价（underlying_price / F）必须由 Worker 层在 `_poll_once` 中显式构造 `tick` 时填入 `tick['underlying_price']` 字段，再传给 `calc_greeks`。Worker 层从 `_engine.query_tick(symbol)` 拿到数据后写入 `tick`，而非让计算函数自行查询。
+
 ```python
 def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
     direction_sign = 1 if position['direction'] in ('long', '多') else -1
@@ -389,57 +446,14 @@ def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
 
 ### 3.5 PnL 三口径计算
 
+> ⚠️ **DEPRECATED（已由 §3.7 替代）**：本节仅保留函数签名作历史参考，正文逻辑已被 §3.7 增强版完全替代。
+
 ```python
 def calc_pnl(position: dict, contract: dict, tick: dict,
              settlement_dict: dict, yesterday_snapshot: dict = None) -> dict:
-    """contract: 合约元数据，含 size（乘数），必须传入，VNPY PositionData 无 size 字段。"""
-    sym = position['symbol'].split('.')[0]
-    direction_str = '多' if position['direction'] in ('long', '多') else '空'
-    direction_sign = 1 if direction_str == '多' else -1
-    vol = position['volume']
-    size = contract.get('size', 1)
-
-    # 真实开仓成本：结算单加权成本优先（逐笔 VWAP），回退 vnpy position['price']
-    cost_price = settlement_dict.get(f"{sym}_{direction_str}", position.get('price', 0.0))
-    if cost_price == 0.0:
-        cost_price = position.get('price', 0.0)
-
-    adj_price  = tick.get('adjust_price', tick.get('last_price', 0))
-    last_price = tick.get('last_price', 0)
-
-    # 历史累计浮盈（开仓至今）— 基准为开仓价，非逐笔成本（二者对多空等价）
-    pnl_history = direction_sign * (adj_price - cost_price) * vol * size
-
-    # 当日盯市盈亏（last_price 对比昨日结算价）
-    # settle_price 从昨日快照取 adjust_price（昨收价），无快照时用合约 pre_close 兜底
-    settle_price = None
-    if yesterday_snapshot:
-        prev = yesterday_snapshot.get(f"{sym}_{direction_str}", {})
-        if prev:
-            settle_price = prev.get('adjust_price')
-    if settle_price is None:
-        settle_price = contract.get('pre_close', 0) or position.get('price', 0)
-    pnl_daily = direction_sign * (last_price - settle_price) * vol * size
-
-    # 当日盈亏（adjust_price 对比昨日快照基准；新开仓用 cost_price）
-    base_today = cost_price
-    if yesterday_snapshot:
-        prev = yesterday_snapshot.get(f"{sym}_{direction_str}", {})
-        if prev:
-            base_today = prev.get('adjust_price', cost_price)
-    pnl_today = direction_sign * (adj_price - base_today) * vol * size
-
-    return {
-        "pnl_daily":   round(pnl_daily,   2),
-        "pnl_today":   round(pnl_today,   2),
-        "pnl_history": round(pnl_history, 2),
-    }
+    """历史签名，请使用 §3.7 的 calc_pnl 增强版"""
+    pass  # 已废弃
 ```
-
-> **PnL 定义确认（来源：旧版 DESIGN.md §一.6/§四）**：
-> - `pnl_daily` = 当日盯市 = Σ direction × (最新价 − 昨日结算价) × volume × size（结算价来源：昨日快照 adjust_price，无快照则用合约 pre_close 兜底）
-> - `pnl_today` = 当日盈亏 = Σ direction × (调整价 − 昨日收盘调整价) × volume × size
-> - `pnl_history` = 历史累计 = Σ direction × (调整价 − 开仓价) × volume × size（开仓价优先取结算单，无结算单则用 position['price']）
 
 ### 3.6 树形聚合规则
 
@@ -451,6 +465,479 @@ L2 月份 → 归属 L1 品种（IF）
   volume      = Σ|pos.volume|（绝对值，反映物理负荷）
   Greeks/PnL  = Σ 带符号代数加总（自然对冲，净方向由正负呈现）
 ```
+
+### 3.7 PnL 三口径计算（增强版：今仓/老仓双基准）
+
+> **来源**：本节内容由 `docs/pnl设计.md` 合并入基线，并经审查意见修正 P0-1~4 后作为唯一正式规范。替代原 3.5 基础版。
+
+#### 口径约定
+
+所有 PnL 分项统一使用以下约定：
+
+```
+signed_qty = direction_sign * abs(volume)   # direction_sign = +1（多）/ -1（空）
+
+pnl = signed_qty * (mark_price - base_price) * size
+```
+
+> ⚠️ **方向铁律**：平仓成交的买卖方向（买/卖）**不得**替代原持仓方向参与 PnL 计算。PnL 符号由原持仓方向决定，与本次成交是买还是卖无关。
+
+#### 核心公式
+
+```
+pnl_today   = direction_sign * (Mark_now - Mark_T-1) * abs(vol) * size
+pnl_history = pnl_realized + pnl_unrealized
+
+pnl_realized   = direction_sign * (P_trade_close - cost_price) * abs(vol_closed) * size
+pnl_unrealized = direction_sign * (Mark_now - cost_price) * abs(vol_remaining) * size
+```
+
+#### 今仓/老仓判断
+
+```
+今仓 = 合约在 full_{T-1}.json 的 positions_detail 中不存在
+     且 合约在 trade_cache 中存在（今天有成交记录）
+
+老仓 = 合约在 full_{T-1}.json 中存在
+```
+
+#### 基准价优先顺序
+
+| | 持仓类型 | pnl_today 基准价 | pnl_history cost_price |
+|---|---|---|---|
+| 老仓 | 昨仓今持、昨仓今平 | 昨快照 adjust_price（T-1 收盘 Mark） | settlement_cost_dict[`{sym}_{direction_str}`] |
+| 老仓降级 | — | T-1 结算单 settlement_price | **无降级** |
+| 今仓 | 今开、今平 | 成交回报 P_trade_open（成交量加权均价 VWAP） | 成交回报 P_trade_open |
+| 今仓降级 | — | **无**（T-1 结算单不存在该合约） | **无** |
+
+#### 四分法（pnl_today）
+
+| | 情形 | 公式 |
+|---|---|---|
+| ① | 昨仓今持（未平） | `direction_sign * (Mark_now - Mark_T-1) * abs(vol) * size` |
+| ② | 昨仓今平（平昨） | `direction_sign * (P_trade_close - Mark_T-1) * abs(vol_closed) * size` |
+| ③ | 今仓未平（新开） | `direction_sign * (Mark_now - P_trade_open) * abs(vol) * size` |
+| ④ | 今仓今平（平今） | `direction_sign * (P_trade_close - P_trade_open) * abs(vol_closed) * size` |
+
+#### 四分法（pnl_history）
+
+| | 情形 | 公式 |
+|---|---|---|
+| ① | 昨仓今持 | `direction_sign * (Mark_now - cost_price) * abs(vol) * size` |
+| ② | 昨仓今平（全平） | `direction_sign * (P_trade_close - cost_price) * abs(vol_closed) * size` |
+| ③ | 今仓未平 | `direction_sign * (Mark_now - P_trade_open) * abs(vol) * size` |
+| ④ | 今仓今平（全平） | `direction_sign * (P_trade_close - P_trade_open) * abs(vol_closed) * size` |
+
+#### 混合持仓处理（数量守恒 + OffsetFlag 归因）
+
+> ⚠️ **归因优先级**：优先使用 CTP `OffsetFlag`（开/平今/平昨）；仅在字段缺失时才使用 FIFO 降级，并标注 `allocation_source`。
+
+```
+已知:
+  volume_old = 昨仓初始 volume（来自 full_{T-1}.json）
+  vol_open   = Σ trade_cache 中 open_close='开' 的 volume
+  vol_close  = Σ trade_cache 中 open_close='平' 的 volume
+  positions  = 当前持仓 volume（来自 CTP position）
+
+Step 1: 按 OffsetFlag 分配（第一优先）
+  若 CloseYesterday 成交记录存在:
+    vol_老_已平 = Σ CloseYesterday volume
+    vol_新_已平 = Σ CloseToday volume
+  否则:
+    # FIFO 降级（仅 OffsetFlag 缺失时）
+    vol_老_已平 = min(volume_old, vol_close)
+    vol_新_已平 = max(0, vol_close - volume_old)   # 平仓超出昨仓部分 = 今仓被平
+
+  vol_老_剩余 = max(0, volume_old - vol_老_已平)
+  vol_新_剩余 = vol_open - vol_新_已平
+
+  # 守恒校验: vol_老_剩余 + vol_新_剩余 == abs(positions)
+  assert abs(positions) == vol_老_剩余 + vol_新_剩余
+
+Step 2: 分别计算今仓/老仓的平仓均价 VWAP
+  P_trade_close_老 = Σ(CloseYesterday 或 FIFO 平老部分的成交价 × 成交量) / vol_老_已平
+  P_trade_close_新 = Σ(CloseToday 或 FIFO 平新部分的成交价 × 成交量) / vol_新_已平
+
+Step 3: 分别计算 PnL
+  pnl_老_today_unrealized = direction_sign * (Mark_now - Mark_T-1) * vol_老_剩余 * size
+  pnl_老_today_realized   = direction_sign * (P_trade_close_老 - Mark_T-1) * vol_老_已平 * size
+  pnl_老_history          = direction_sign * (P_trade_close_老 - cost_price) * vol_老_已平 * size
+                           + direction_sign * (Mark_now - cost_price) * vol_老_剩余 * size
+
+  pnl_新_today_unrealized = direction_sign * (Mark_now - P_trade_open) * vol_新_剩余 * size
+  pnl_新_today_realized   = direction_sign * (P_trade_close_新 - P_trade_open) * vol_新_已平 * size
+  pnl_新_history          = pnl_新_today_realized + pnl_新_today_unrealized
+
+Step 4: 汇总
+  pnl_today   = (pnl_老_today_unrealized + pnl_老_today_realized
+               + pnl_新_today_unrealized + pnl_新_today_realized)
+  pnl_history = pnl_老_history + pnl_新_history
+```
+
+#### 边界情况
+
+| 情况 | 处理方式 |
+|---|---|
+| 同一合约多次开仓 | 取成交量加权均价（VWAP） |
+| 今开今平（当日回转） | vol_新_已平 = vol_open，`pnl_新 = pnl_新_today_realized`（全为已实现） |
+| 老仓今平（部分） | vol_老_剩余 > 0，老仓同时有 realized + unrealized |
+| 老仓今平（全平） | vol_老_剩余 = 0，老仓只有 realized，合约从持仓 tree 消失 |
+| vnpy TdApi 重连 | trade_cache 保留（进程内），重连后追加，幂等去重（见 §3.8） |
+| OffsetFlag 缺失、FIFO 降级 | 标注 `allocation_source: "fifo_fallback"`，并记录日志 |
+
+#### 已完全平仓合约的 PnL 通道
+
+> 全平合约从持仓 tree 消失，但其 realized PnL 必须进入当日和历史汇总。
+
+```
+实现方式：
+  _realized_pnl_cache: dict[sym, running_total]  # 每笔成交实时累加
+  在 /api/dashboard 返回前：
+    realized_today = Σ _realized_pnl_cache[sym]
+    summary["total_pnl_today"]   += realized_today
+    summary["total_pnl_history"] += realized_today
+    # 当前持仓只贡献 unrealized_pnl
+```
+
+#### calc_pnl 增强版函数签名
+
+```python
+def calc_pnl(position: dict, contract: dict, tick: dict,
+             settlement_dict: dict, settlement_prices: dict,
+             yesterday_snapshot: dict, trade_cache: dict = None) -> dict:
+    """请通过 build_tree 统一调用，不要单独调用本函数。
+    
+    持仓 tree 由 Worker 的 build_tree 统一构建，已平合约的 realized PnL
+    由 _realized_pnl_cache 单独聚合，不通过本函数返回。
+    """
+    sym = position['symbol'].split('.')[0]
+    direction_str = '多' if position['direction'] in ('long', '多') else '空'
+    direction_sign = 1 if direction_str == '多' else -1
+    vol = abs(position['volume'])
+    size = contract.get('size', 1)
+    signed_qty = direction_sign * vol
+
+    # 真实开仓成本：结算单 VWAP，key 必须带方向维度
+    cost_price = settlement_dict.get(f"{sym}_{direction_str}", position.get('price', 0.0))
+    if cost_price == 0.0:
+        cost_price = position.get('price', 0.0)
+
+    adj_price  = tick.get('adjust_price', tick.get('last_price', 0))
+    last_price = tick.get('last_price', 0)
+
+    # pnl_history
+    pnl_unrealized = direction_sign * (adj_price - cost_price) * vol * size
+    pnl_history = pnl_unrealized  # realized 由 trade_cache 单独累加到 summary
+
+    # pnl_today
+    base_today = cost_price
+    if yesterday_snapshot:
+        prev = yesterday_snapshot.get(f"{sym}_{direction_str}", {})
+        if prev:
+            base_today = prev.get('adjust_price', cost_price)
+    pnl_today = direction_sign * (adj_price - base_today) * vol * size
+
+    return {
+        "pnl_daily":   round(direction_sign * (last_price - base_today) * vol * size, 2),
+        "pnl_today":   round(pnl_today, 2),
+        "pnl_history": round(pnl_history, 2),
+    }
+```
+
+> **注意**：结算单中的 `prev_sttl_price`（昨结算列）**永远不使用**。
+
+### 3.8 CTP 成交回报（进程内账本）
+
+#### 账本分组 Key（不含 offset）
+
+> ⚠️ `offset`（开/平）不能放入分组 Key，否则同一持仓方向的开仓和平仓记录会被割裂到不同组，无法共同参与 PnL 计算。
+
+```python
+_ledger_key = (trading_day, account, exchange, symbol, position_direction)
+# position_direction = '多'（原持仓为多，平卖也是"空头平仓"，但 group key 用原持仓方向）
+# 注意：分组键中不含 offset；offset 保留在每条成交记录中用于归因
+```
+
+#### 去重 Key
+
+```python
+_dedup_key = (trading_day, account, exchange, trade_id)
+# 每条成交记录到达时，先查 _seen_trade_ids
+# 若已存在：幂等跳过，不重复处理
+# 若不存在：写入 _seen_trade_ids，继续处理
+```
+
+#### 每条成交记录格式
+
+```json
+{
+  "dedup_key": "20260915_101009_CFFEX_278350",
+  "ledger_key": ["20260915", "101009", "CFFEX", "MO2609-P-7000", "多"],
+  "trade_id": "278350",
+  "symbol": "MO2609-P-7000",
+  "direction": "买",
+  "position_direction": "多",
+  "open_close": "开",
+  "offset_flag": "open",
+  "price": 11.600,
+  "volume": 1,
+  "trade_time": "20260915 09:30:12",
+  "account": "101009",
+  "exchange": "CFFEX",
+  "trading_day": "20260915"
+}
+```
+
+> **字段说明**：
+> - `position_direction`：原持仓方向（多/空），由第一条成交记录决定，后续同组记录沿用
+> - `offset_flag`：CTP 原生字段，`open` / `close_today` / `close_yesterday`；缺失时由 `open_close` 推断并标注 `allocation_source: "fifo_fallback"`
+> - `dedup_key`：用于幂等去重，确保重连重放不重复计入
+
+#### onRtnTrade 回调（幂等版）
+
+```python
+_seen_trade_ids: set = set()
+
+def onRtnTrade(self, trade: dict):
+    trading_day = trade.get('trading_day', '')
+    account     = trade.get('account_id', '')
+    exchange    = trade.get('exchange', '')
+    trade_id    = trade.get('order_sys_id', '')
+
+    dedup_key = (trading_day, account, exchange, trade_id)
+    if dedup_key in _seen_trade_ids:
+        return  # 幂等去重
+
+    symbol = trade['instrument_id'].split('.')[0]
+    raw_dir = trade.get('direction', '')
+    position_direction = '多' if raw_dir in ('long', '买') else '空'
+
+    # offset_flag：优先取 CTP 原生字段，缺失时推断
+    offset_flag = trade.get('offset_flag', '')
+    if not offset_flag:
+        is_open = is_open_trade(trade)
+        offset_flag = 'open' if is_open else 'close_yesterday'
+        allocation_source = 'fifo_fallback'
+    else:
+        allocation_source = 'ctp_offset'
+
+    record = {
+        'dedup_key': f"{trading_day}_{account}_{exchange}_{trade_id}",
+        'ledger_key': [trading_day, account, exchange, symbol, position_direction],
+        'trade_id': trade_id,
+        'symbol': symbol,
+        'direction': raw_dir,
+        'position_direction': position_direction,
+        'open_close': '开' if offset_flag == 'open' else '平',
+        'offset_flag': offset_flag,
+        'allocation_source': allocation_source,
+        'price': trade['price'],
+        'volume': trade['volume'],
+        'trade_time': trade.get('trade_time', ''),
+        'account': account,
+        'exchange': exchange,
+        'trading_day': trading_day,
+    }
+    _seen_trade_ids.add(dedup_key)
+    _trade_cache.setdefault(tuple(record['ledger_key']), []).append(record)
+```
+
+#### 持久化行为
+
+> **trade_cache 持久化策略（唯一正式行为）**：
+> - `session_state.json` 保存 `_trade_cache` 完整内容（含所有历史成交记录）
+> - 服务重启后：从 `session_state.json` 恢复，视为"昨仓降级"场景
+> - 今仓基准（成交均价 VWAP）：**重启后丢失，归零处理**；这是受控降级，不是"持久化后完整恢复"
+
+#### 3.8.2 已实现 PnL 实时累加
+
+```python
+_realized_pnl_cache: dict[str, float] = {}  # key = symbol，value = 累计 realized PnL
+
+def onRtnTrade(self, trade: dict):
+    # ... 上述处理 ...
+    if offset_flag != 'open':
+        # 计算已实现 PnL
+        sym = symbol
+        direction_sign = 1 if position_direction == '多' else -1
+        pnl_realized = direction_sign * (trade['price'] - cost_price) * trade['volume'] * size
+        _realized_pnl_cache[sym] = _realized_pnl_cache.get(sym, 0) + pnl_realized
+```
+
+### 3.9 开盘判断与事件驱动
+
+#### 开盘判断规则（事件驱动）
+
+```
+任何合约当天收到第一个 tick → 标记为"已开盘"，开始计算 pnl_today
+没收到 tick → pnl_today = 0
+跨交易日自动清空（CTP TradingDay 变化）
+```
+
+不按品种/时间表机械判断，纯事件驱动：收到 tick = 开盘。
+
+#### 持久化范围
+
+| 数据 | 持久化 | 原因 |
+|---|---|---|
+| 持仓快照（positions_summary + adjust_price） | ✅ | 服务重启后恢复 |
+| 结算成本（settlement_cost_dict） | ✅ | 本地文件，已实现 |
+| CTP成交回报（trade_cache） | ✅ | 今仓基准，重启后丢失只能归零 |
+| 持仓合约开盘状态（opened_contracts） | ✅ | 重启后恢复哪些合约已开盘 |
+| 实时行情（tick） | ❌ | 随时变化，重启后重新接收 |
+
+### 3.A session_state.json 持久化结构与重启恢复
+
+#### 数据结构
+
+```json
+{
+  "trading_day": "20260916",
+  "opened_contracts": {
+    "IC2609": {"first_tick": "09:30:05"},
+    "jm2610": {"first_tick": "21:00:12"}
+  },
+  "trade_cache": {
+    "MO2609-P-7000": [
+      {"trade_id": "278350", "direction": "买", "open_close": "开", "price": 11.600, "volume": 1, "trade_time": "20260916 09:30:12"}
+    ]
+  },
+  "positions_summary": { ... }
+}
+```
+
+#### 重启恢复逻辑
+
+```
+启动时:
+  1. 加载 session_state.json
+  2. 若 trading_day == 当前交易日:
+       恢复 opened_contracts（已开盘合约继续算 pnl_today）
+       恢复 trade_cache（昨仓降级用，今仓基准丢失只能归零）
+  3. 若 trading_day != 当前交易日:
+       清空 opened_contracts（新一轮交易日）
+       清空 trade_cache
+```
+
+#### 盘中持久化时机
+
+```
+触发条件:
+  - 持仓发生变化（position.volume 变化）
+  - 成交回报到达（trade_cache 新增条目）
+  - 合约首次收到 tick（opened_contracts 新增）
+
+写入方式:
+  - 异步写，不阻塞主流程
+  - 每 30 分钟心跳保存（即使无变化）
+```
+
+### 3.B 附录：PnL 关键字段说明
+
+| 字段 | 来源 | 用途 |
+|---|---|---|
+| `adjust_price` | 行情 tick | 当前 Mark Price |
+| `settlement_price`（T-1） | full_{T-1}.json | 老仓 pnl_today 降级基准 |
+| `settlement_cost` | settlement_cost_dict | 老仓 pnl_history cost_price |
+| `prev_sttl_price` | full_*.json | **不使用** |
+| `P_trade_open` | CTP onRtnTrade | 今仓 pnl_today 和 pnl_history 基准 |
+| `P_trade_close` | CTP onRtnTrade | 平仓盈亏计算 |
+
+---
+
+## 三-B、快照引擎业务规则
+
+> **来源**：快照引擎业务规则合并入基线（2026-09-17）。
+
+### 三-B.1 快照时间表
+
+| Session | 文件名 | 含义 |
+|---------|--------|------|
+| N（夜盘） | `data_snapshot_{date}_N.json` | 上一交易日 20:20 → 当日 15:00 截面 |
+| A（早盘） | `data_snapshot_{date}_A.json` | 当日早盘 09:00 → 11:30 截面 |
+| P（午盘） | `data_snapshot_{date}_P.json` | 当日午盘 13:00 → 15:00 截面 |
+
+同一交易日（上一日 20:20 → 次日 16:00）数据**连续继承**，交易日变更时数据重置。
+
+### 三-B.2 保存逻辑（核心规则）
+
+**触发方式：持续检测 + 定时保存**
+
+1. **Dirty Flag 检测**（每个合约级别）：
+   - `_poll_once` 每轮检测：若任一合约的持仓量、adjust_price 或 Greeks 与上一份快照有差异，标记 dirty
+   - Dirty 合约积累到一定程度 → 全局 dirty flag = true
+
+2. **每 30 分钟定时保存**：
+   ```
+   若 dirty == true:
+       保存当前状态到 data_snapshot_{date}_{session}.json（覆盖式）
+       dirty = false
+   若 dirty == false:
+       不写入（节省磁盘，无变化不写）
+   ```
+
+3. **覆盖式而非追加式**：同一 session 只有一份文件，每次保存是整体覆盖，不是追加
+
+4. **空仓快照规范写入**：
+   ```
+   即使当前持仓为空（volume == 0），也必须写入快照文件：
+   - 文件内容包含 snapshot_kind = "empty"
+   - 不另建 _empty 后缀文件，统一写入同名 snapshot 文件
+   - 目的：清除前一个 session 的非空数据，确保 T+1 开盘基准干净
+   ```
+
+5. **原子写（防文件损坏）**：
+   ```
+   标准 POSIX 原子替换流程：
+   1. 写入 tempfile（os.path.dirname + ".tmp_" + os.path.basename）
+   2. flush + fsync（确保内核缓冲区落盘）
+   3. os.replace(tempfile, target)（原子替换）
+   4. 若写失败：记录日志，不抛异常，不阻塞主流程
+   ```
+
+6. **TradingDay 绑定**：
+   ```
+   快照日期强制使用 CTP TradingDay，禁止使用本机 clock。
+   Worker 在交易日切换时（T-1 15:00 后或 20:20 后）清空 opened_contracts 和 trade_cache，
+   生成新的 session 文件。
+   ```
+
+7. **发布后禁止写入（Immutable Snapshot）**：
+   ```
+   _snapshot = copy.deepcopy(tree)  # Worker 在发布前深拷贝
+   快照一旦写入 _shared_state["snapshot"]，禁止任何代码再修改其内容。
+   所有后续计算必须基于新 tick 数据增量更新，不得原地修改已发布的快照对象。
+   ```
+
+### 三-B.3 快照文件命名
+
+```
+data_snapshot_{YYYYMMDD}_{session}.json
+# 示例：data_snapshot_20260916_N.json
+```
+
+- 同一交易日共用同一 base date（如 0916 的 N/A/P 三份快照都叫 20260916）
+- session 变更时文件名 session 段变化，内容整体继承上一份
+
+### 三-B.4 跨 Session 继承
+
+```
+N → A → P（同一交易日内连续）
+T-1_P → T_N（跨交易日，清空 opened_contracts 和 trade_cache）
+```
+
+- 持仓数量、adjust_price、pnl_today 等值在 N→A→A→P 过程中逐步更新
+- 切换交易日时（TradingDay 变化），opened_contracts 和 trade_cache 必须清空
+
+### 三-B.5 例外处理与容错
+
+| 情况 | 处理 |
+|---|---|
+| 空仓（volume == 0） | **必须写入快照**（含 `snapshot_kind: "empty"`），不清空则 T+1 开盘基准不干净 |
+| 服务异常退出 | 上一次完整写入的快照即为恢复基准 |
+| 磁盘写失败 | 记录日志，不抛异常，不阻塞主流程 |
+| 快照中 adjust_price = None | 使用 position.price 兜底 |
+| TradingDay 切换 | 清空 opened_contracts + trade_cache，session 重置 |
 
 ---
 
@@ -582,6 +1069,8 @@ const UIState = {
 
 ## 六、API 端点
 
+### 6.1 端点列表
+
 | 路由 | 方法 | 功能 |
 |------|------|------|
 | `/api/dashboard` | GET | 获取完整聚合快照数据 |
@@ -589,9 +1078,59 @@ const UIState = {
 | `/api/ctp/connect` | POST | 启动 CTP 引擎 |
 | `/api/ctp/disconnect` | POST | 安全关闭连接 |
 
+### 6.2 CTP 端点安全要求
+
+> ⚠️ CTP 连接端点（`/api/ctp/connect`）**仅允许 loopback（127.0.0.1）访问**，禁止监听公网端口。
+
+| 安全措施 | 要求 |
+|---------|------|
+| 网络隔离 | API 服务仅监听 `127.0.0.1:5000`，禁止绑定 `0.0.0.0` |
+| 鉴权 | 所有 CTP 操作端点需携带账户凭证（当前通过 `ctp_config.json` 本地文件管理） |
+| CSRF | Flask 路由加 `@csrf.exempt` 仅限开发；生产环境需启用 CSRFProtect |
+| 审计 | 每次 connect/disconnect 记录审计日志（含时间戳、来源IP、操作类型） |
+| 限流 | CTP 连接/断开操作每分钟不超过 5 次，超限返回 429 |
+| 凭证保护 | `ctp_config.json` 包含明文密码，**禁止提交到 Git**，已加入 `.gitignore` |
+
+### 6.3 Tick 质量字段
+
+> 每 tick 推送时，Worker 必须填充以下质量字段，供前端和计算层判断数据可用性：
+
+```
+market_status 取值：
+  - "valid":       正常交易，数据可用
+  - "not_opened":  合约当日尚未开盘（未收到 tick）
+  - "stale":       合约已开盘但超过 30s 未更新（数据可能过时）
+  - "invalid_underlying": 标的期货价格为 0 或 NaN（期权 Greeks 计算无效）
+
+price_source 取值：
+  - "mid_price":   盘口中间价
+  - "last_price":   最新价（无盘口时降级）
+  - "pre_close":    昨收价（无现价时降级）
+  - "none":         完全无价格
+
+timestamp:  tick 到达时间（Unix 秒），用于 stale 判断
+```
+
+### 6.4 输入校验规则
+
+```
+volume == 0 的持仓：
+  - 在进入 build_tree 之前过滤，禁止进入树结构
+  - 已平仓合约的 realized PnL 通过 _realized_pnl_cache 聚合，不依赖持仓树
+
+calc_status 约定：
+  - 指标计算失败（NaN/异常）时，该指标字段返回 null，不返回 0
+  - 同时返回 calc_status: {<field>: "error"|"missing"|"ok"} 说明各字段状态
+  - calc_status 本身不为 null，始终存在
+```
+
 ---
 
-## 七、文件结构与实施计划
+> ⚠️ **§七已废弃（DEPRECATED）**：本节内容已被 §十二替代。请勿修改本节，仅作历史参考。
+>
+> v1.3 升级后，**§十二 文件结构**为唯一权威目录，`Dashboard_重构设计.md` 内容已全部被本文档吸收，不再维护。
+
+## 七、文件结构与实施计划（已废弃，请参考 §十二）
 
 ```
 C:/Quant_2026/期货执行策略/GreeksDashboard_v0.1/
@@ -662,8 +1201,8 @@ def tag_pnl(pnl):
 
 | 编号 | 严重度 | 缺口描述 | 涉及文件 | 修正方向 | 状态 |
 |------|--------|---------|---------|---------|------|
-| **B1** | P0 | `build_tree` L291 每个 L3 节点先进 l1_metrics，L297-298 L2（含全部L3）又进 l1_metrics → L1 Greeks 是真实值 2× | risk_engine.py | 删 L291 的 `_accumulate_metrics(l1_metrics, node)`，只保留 L309 L2 进 L1 | 待修 |
-| **B2** | P0 | `pricing.py` L343 gammacash 写 `s*s*0.01*0.01*size`（多乘 0.01²），应 `s*s*0.01*size` | pricing.py | 删一个 `*0.01` | 待修 |
+| **B1** | P0 | `build_tree` L291 每个 L3 节点先进 l1_metrics，L297-298 L2（含全部L3）又进 l1_metrics → L1 Greeks 是真实值 2× | risk_engine.py | 删 L291 的 `_accumulate_metrics(l1_metrics, node)`，只保留 L309 L2 进 L1 | 修复中/待数值验证 |
+| **B2** | P0 | `pricing.py` L343 gammacash 写 `s*s*0.01*0.01*size`（多乘 0.01²），实际 Gamma cash 缩小 100 倍 | pricing.py | 删一个 `*0.01` | 修复中/待数值验证 |
 | **B3** | P1 | 结算单缺 09-11/09-14；无结算单时 open_price=0，pnl_daily 错误 | settlement.py / api_server.py | 结算单路径用绝对路径；无结算单时 settle_key=0 | 待修 |
 
 ### 原 v1.0 缺口状态
@@ -699,7 +1238,7 @@ CtpTdApi.exit()         # ❌ 同上
 
 ---
 
-## 十二、文件结构与实施计划
+## 十二、文件结构与实施计划（唯一权威目录）
 
 ```
 C:/Quant_2026/期货执行策略/GreeksDashboard_v0.1/   (= C:/qproj/ 软链接)

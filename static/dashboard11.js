@@ -468,7 +468,7 @@ function renderSummary(s) {
   set('sumPnlD',  s.total_pnl_daily,   0);
   set('sumPnlT',  s.total_pnl_today,   0);
   set('sumPnlH',  s.total_pnl_history, 0);
-  set('posCount', snap.tree ? snap.tree.reduce((n, l1) => n + l1.children.reduce((m, l2) => m + (l2.children || []).length, 0), 0) : 0, 0);
+  set('posCount', s.tree ? s.tree.reduce((n, l1) => n + l1.children.reduce((m, l2) => m + (l2.children || []).length, 0), 0) : 0, 0);
 
   // Summary 行颜色
   const pnlH = parseFloat(s.total_pnl_history) || 0;
