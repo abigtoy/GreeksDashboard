@@ -1,5 +1,18 @@
 # pnl_today 计算方案设计
 
+> ## ⛔ DEPRECATED（2026-09-18）
+>
+> 本文是 **实现前设计稿（2026-09-16）**，与落码后的实际行为已多处不符，**仅作历史留档，不作规范、不可引用**。
+>
+> 唯一权威口径：`Dashboard_设计基线.md` **v1.5** §3.7（PnL 两口径 + 四档基准降级链 + `price_basis`/`cost_basis` 可见性）与 §3.8（成交回报与成交账本落盘/重放），配套 §三-B（快照引擎 v1.4）。
+>
+> 本文与现状的主要差异（勿照此实现）：
+> 1. **「多交易时段（早A / 午M / 夜N）状态管理」已废弃**（基线 v1.4）：快照改为每业务日仅 15:00 收盘一份 `close_snapshot_{TradingDay}.json`，基准取窗口内 Mark 时间等差算术平均
+> 2. **`pnl_daily`（盯日盈亏）口径已于 v1.5 整体删除**，PnL 只剩 `pnl_today` / `pnl_history`
+> 3. 今仓基准的实现落点是**成交账本加权开仓价** `today_open_cost`（`快照/trade_ledger.json`，CTP TradingDay 分区），不是本文设想的内存 trade_cache + `session_state.json`（该文件从未实现）
+> 4. 昨仓基准优先 **T-1 收盘快照 Mark**，昨结算价仅为整份快照缺失时的降级；本文的时段回退链已废
+> 5. 每条腿带 `price_basis` 标签并由 `summary.pnl_basis_counts` 计数告警，本文无此机制
+
 ## 1. 背景与目标
 
 GreeksDashboard 采用**双调整价（Mark-to-Mark）**体系计算当日盈亏（pnl_today）。

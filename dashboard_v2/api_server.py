@@ -47,7 +47,7 @@ from vnpy_engine import VNPYEngine
 from loguru import logger
 from dashboard_v2.risk_engine import build_tree
 from dashboard_v2.pricing import price_options_batch, days_to_expiry
-from dashboard_v2.settlement import SettlementManager
+from dashboard_v2.settlement import SettlementManager, _valid_dates
 
 # ── 共享状态（Worker 写，API 读，无锁 Python 对象）────────────────────────────
 # 均为 Python 对象，无锁，Worker 线程写，Flask API 读
@@ -64,6 +64,7 @@ _shared_state = {
     "account": {},            # dict  账户信息
     "ctp_status": "disconnected",   # "disconnected" | "connecting" | "connected" | "error"
     "ctp_error": "",          # str   错误信息
+    "instance_status": "running",   # "running" | "stopping"
     "last_update": None,      # datetime  最后更新时间
     "worker_alive": False,    # bool  Worker 线程是否存活
     "column_config": [        # 列配置（顺序、显隐、fmt掩码）
@@ -82,7 +83,6 @@ _shared_state = {
         {"col": "vegacash",         "label": "VegaCash",  "visible": True, "fmt": "0"},
         {"col": "thetacash",        "label": "ΘCash",     "visible": True, "fmt": "0"},
         {"col": "days_to_expiry",   "label": "剩余天",    "visible": True, "fmt": "0"},
-        {"col": "pnl_daily",        "label": "盯日盈亏",  "visible": True, "fmt": "0"},
         {"col": "pnl_today",        "label": "当日盈亏",  "visible": True, "fmt": "0"},
         {"col": "pnl_history",      "label": "浮动盈亏",  "visible": True, "fmt": "0"},
     ],
@@ -105,8 +105,146 @@ _SEEN_TRADE_IDS: set = set()   # 幂等去重：(trading_day, account, exchange,
 # 全平合约从持仓 tree 消失，但其 realized PnL 必须进入当日和历史汇总
 _REALIZED_PNL_CACHE: dict[str, float] = {}   # key = symbol, value = 累计 realized PnL
 
+# ── F2: 成交账本持久化 + 今日开仓加权价（重启不丢当日已实现盈亏）──────────────
+# 文件：快照/trade_ledger.json = {"trading_day": "YYYYMMDD", "trades": [record…]}
+# record 内自带 realized_pnl / cost_price / cost_basis → 重启按原值重放，不重算
+# 交易日以 CTP TradingDay 为权威：切日即清零（昨日的账由结算单接管）
+_LEDGER_FILE_NAME = "trade_ledger.json"
+_LEDGER_TRADING_DAY: str = ""           # 当前内存账本所属交易日
+_TODAY_OPEN_ACC: dict[str, list] = {}   # f"{sym}_{pos_dir}" → [Σ(价×量), Σ量]
+_BASIS_WARN_SIGNATURE: str = ""         # 上次基准告警签名，避免每轮 poll 刷日志
+
+
+def _ledger_path() -> str:
+    return _os.path.join(_SNAPSHOT_DIR, _LEDGER_FILE_NAME)
+
+
+def _reset_trade_state() -> None:
+    _TRADE_CACHE.clear()
+    _SEEN_TRADE_IDS.clear()
+    _REALIZED_PNL_CACHE.clear()
+    _TODAY_OPEN_ACC.clear()
+
+
+def _accum_open_cost(rec: dict) -> None:
+    """开仓成交累加今日开仓加权成本。"""
+    p = float(rec.get('price', 0) or 0)
+    v = int(rec.get('volume', 0) or 0)
+    if p <= 0 or v <= 0:
+        return
+    k = f"{rec.get('symbol')}_{rec.get('position_direction')}"
+    acc = _TODAY_OPEN_ACC.setdefault(k, [0.0, 0])
+    acc[0] += p * v
+    acc[1] += v
+
+
+def _open_cost_map() -> dict:
+    """今日开仓加权价 → calc_pnl 的 today_open_cost（key 与 {sym}_{direction} 对齐）。"""
+    return {k: amt / vol for k, (amt, vol) in _TODAY_OPEN_ACC.items() if vol > 0}
+
+
+def _replay_trade_record(rec: dict) -> None:
+    """从落盘记录重建内存账本（按 dedup_key 幂等）。"""
+    dk = rec.get("dedup_key") or ""
+    key = tuple(rec.get("ledger_key") or [])
+    if not dk or len(key) != 5 or dk in _SEEN_TRADE_IDS:
+        return
+    _SEEN_TRADE_IDS.add(dk)
+    _TRADE_CACHE.setdefault(key, []).append(rec)
+    if rec.get("offset_flag") == "open":
+        _accum_open_cost(rec)
+    sym = rec.get("symbol", "")
+    _REALIZED_PNL_CACHE[sym] = _REALIZED_PNL_CACHE.get(sym, 0.0) + float(rec.get("realized_pnl", 0.0) or 0.0)
+
+
+def _save_trade_ledger() -> None:
+    """每笔成交后原子落盘。ponytail: 全量重写，日内成交条数有限；上千条时改追加写。"""
+    try:
+        trades = [r for lst in _TRADE_CACHE.values() for r in lst]
+        path = _ledger_path()
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"trading_day": _LEDGER_TRADING_DAY, "trades": trades},
+                      f, ensure_ascii=False, indent=1)
+            f.flush()
+            _os.fsync(f.fileno())
+        _os.replace(tmp, path)
+    except Exception:
+        logger.exception("[ledger] 落盘失败（内存账本仍有效，重启会丢当日已实现）")
+
+
+def _load_trade_ledger(expected_day: str = "") -> None:
+    """启动时重放账本。expected_day 为空 → 先装载，待 CTP TradingDay 到手再校验。"""
+    global _LEDGER_TRADING_DAY
+    try:
+        with open(_ledger_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.exception("[ledger] 读取失败，今日已实现盈亏从 0 起算")
+        return
+    td = str(data.get("trading_day") or "")
+    if expected_day and td and td != expected_day:
+        logger.info(f"[ledger] 账本日 {td} ≠ 交易日 {expected_day} → 丢弃，等结算单接管")
+        _LEDGER_TRADING_DAY = expected_day
+        return
+    trades = data.get("trades") or []
+    _reset_trade_state()
+    for rec in trades:
+        _replay_trade_record(rec)
+    _LEDGER_TRADING_DAY = td or expected_day
+    if trades:
+        logger.info(f"[ledger] 重放 {len(trades)} 笔（交易日 {td}），已实现合计 {sum(_REALIZED_PNL_CACHE.values()):.2f}")
+
+
+def _rollover_trading_day(td: str) -> None:
+    """以 CTP TradingDay 为账本分区键；切日清零。"""
+    global _LEDGER_TRADING_DAY
+    if not td:
+        return
+    if not _LEDGER_TRADING_DAY:
+        _load_trade_ledger(td)
+        if not _LEDGER_TRADING_DAY:
+            _LEDGER_TRADING_DAY = td
+    if _LEDGER_TRADING_DAY != td:
+        logger.info(f"[ledger] 交易日切换 {_LEDGER_TRADING_DAY} → {td}，账本清零")
+        _reset_trade_state()
+        _LEDGER_TRADING_DAY = td
+
+
+def _ctp_trading_day() -> str:
+    """CTP 权威交易日（YYYYMMDD）。CtpTdApi 登录时保存，未登录返回 ''。"""
+    try:
+        eng = _engine
+        gw = eng.main_engine.gateways.get("CTP") if (eng and eng.main_engine) else None
+        if gw and getattr(gw, "td_api", None):
+            return str(getattr(gw.td_api, "trading_day", "") or "")
+    except Exception:
+        pass
+    return ""
+
 # ── P0-8: 开盘合约标记（事件驱动：收到 tick 即标记）────────────────────────────
 _OPENED_CONTRACTS: dict[str, dict] = {}  # key = symbol, value = {first_tick: "HH:MM:SS"}
+
+# ── P0-8 补充：行情推送日标记（received_today）─────────────────────────────────
+# 进程内记录，Tick 断线重连/新合约上线/隔夜后首笔行情均自动重置
+_RECEIVED_TODAY_DATE: str = ""          # 当前已激活的交易日（YYYYMMDD）
+_RECEIVED_TODAY: dict[str, bool] = {}   # {sym: True}  收到今日行情推送的合约集合
+
+# ── 收盘快照（v1.4）：每业务日仅 15:00 一份，基准 = 收盘前窗口 Mark 算术平均 ──
+# 采样：14:55:00–15:00:00 每轮 _poll_once 之后读当时的 adjust_price（Mark，盘口驱动，不依赖成交）
+# 写盘：15:00 之后第一轮 poll；15:00–15:10 为失败重试窗；写完即锁定，不覆盖不重写
+# 口径：不用末成交价（期权尾盘稀疏 + 做市商撤单），不做成交量加权，重复样本不去重（等价按时间加权）
+_CLOSE_PREFIX = "close_snapshot_"
+_CLOSE_SAMPLE_START = datetime.time(14, 55, 0)
+_CLOSE_SAMPLE_END   = datetime.time(15, 0, 0)
+_CLOSE_RETRY_END    = datetime.time(15, 10, 0)
+_MARK_SAMPLES: dict[str, list] = {}     # {f"{sym}_{direction}": [mark, ...]} 窗口内时间等差样本
+_SAMPLE_BD: str = ""                    # 当前采样缓冲所属业务日（跨日清空）
+_CLOSE_SAVED: set = set()               # 已落盘（或已放弃）的业务日
+_SEEN_NONEMPTY_POS: bool = False        # 本连接内是否见过非空持仓 —— 真空仓的唯一佐证
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -161,12 +299,19 @@ _RETRY_IDLE_INTERVAL = 1800     # 30min 兜底重试
 
 
 def _set_status(status: str, error: str = None, alive: bool = None):
+    """写共享状态；进入 connected 时重置"真空仓佐证"（新连接内必须重新见过非空持仓）。"""
+    global _SEEN_NONEMPTY_POS
     with _shared_lock:
+        prev = _shared_state["ctp_status"]
         _shared_state["ctp_status"] = status
         if error is not None:
             _shared_state["ctp_error"] = error
         if alive is not None:
             _shared_state["worker_alive"] = alive
+    if status == "connected" and prev != "connected":
+        _SEEN_NONEMPTY_POS = False
+    elif status != "connected":
+        _SEEN_NONEMPTY_POS = False
 
 
 def _td_logged_in(engine: VNPYEngine) -> bool:
@@ -244,28 +389,35 @@ def _on_trade(trade) -> None:
       2. 降级推断（无 offset_flag 时）：由 open_close 推断，并标注 allocation_source="fifo_fallback"
     """
     try:
-        trading_day = getattr(trade, 'datetime', '')[:10] if getattr(trade, 'datetime', '') else ''
-        if not trading_day:
-            trading_day = datetime.datetime.now().strftime('%Y%m%d')
+        dt_str = str(getattr(trade, 'datetime', '') or '')
+        # 交易日以 CTP TradingDay 为权威（夜盘 21:00 的成交属下一业务日）
+        # 取不到（未登录等）才退回成交自然日，仅作兜底
+        trading_day = _ctp_trading_day() or dt_str[:10].replace('-', '') \
+            or datetime.datetime.now().strftime('%Y%m%d')
         account  = getattr(trade, 'gateway_name', '') or ''
         exchange = getattr(trade, 'exchange', '') or ''
         if hasattr(trade, 'exchange') and hasattr(trade.exchange, 'value'):
             exchange = trade.exchange.value
-        trade_id = getattr(trade, 'tradeid', '') or ''
+        # 无 tradeid 时用 时间+价+量 合成，保证幂等去重与重放可用
+        trade_id = getattr(trade, 'tradeid', '') or f"{dt_str}_{getattr(trade, 'price', 0)}_{getattr(trade, 'volume', 0)}"
     except Exception:
         return
 
-    dedup_key = (trading_day, account, exchange, trade_id)
+    dedup_key = f"{trading_day}_{account}_{exchange}_{trade_id}"
     if dedup_key in _SEEN_TRADE_IDS:
         return
     _SEEN_TRADE_IDS.add(dedup_key)
+    _rollover_trading_day(trading_day)
 
     try:
         symbol = getattr(trade, 'symbol', '') or ''
         if '.' in symbol:
             symbol = symbol.split('.')[0]
         raw_dir = str(getattr(trade, 'direction', '') or '')
-        position_direction = '多' if raw_dir in ('long', 'long', 'Long', '多', '买', 'B', '1', 'Buy') else '空'
+        # vnpy 枚举：str(Direction.LONG)=='Direction.LONG'、.value=='多'
+        # 旧代码拿枚举串去匹配 ('long','Long','B'…) → 永不命中，所有成交恒判 short，已实现盈亏符号全反
+        dir_val = getattr(getattr(trade, 'direction', None), 'value', '') or ''
+        trade_side = 'short' if (dir_val == '空' or 'SHORT' in raw_dir.upper()) else 'long'
 
         # offset_flag：优先取 CTP 原生字段
         offset_flag = ''
@@ -280,6 +432,7 @@ def _on_trade(trade) -> None:
         elif raw_offset in ('平昨', 'CLOSEYESTERDAY', 'close_yesterday', 'CloseYesterday'):
             offset_flag = 'close_yesterday'
         elif raw_offset in ('平', 'CLOSE', 'close', 'Close'):
+            # 中金所等只报"平"，不区分今昨 → 先按昨结，无昨结时降级落到今开成本
             offset_flag = 'close_yesterday'
         else:
             # 降级推断
@@ -287,50 +440,82 @@ def _on_trade(trade) -> None:
             is_open = getattr(trade, 'is_open', False)
             offset_flag = 'open' if is_open else 'close_yesterday'
 
+        # 头寸方向：开仓与买卖同向；平仓反向（卖平 = 平掉多头）
+        position_direction = trade_side if offset_flag == 'open' else (
+            'short' if trade_side == 'long' else 'long')
+
         price = float(getattr(trade, 'price', 0) or 0)
         volume = int(getattr(trade, 'volume', 0) or 0)
 
         record = {
-            'dedup_key': f"{trading_day}_{account}_{exchange}_{trade_id}",
+            'dedup_key': dedup_key,
             'ledger_key': [trading_day, account, exchange, symbol, position_direction],
             'trade_id': trade_id,
             'symbol': symbol,
             'direction': raw_dir,
+            'trade_side': trade_side,
             'position_direction': position_direction,
             'open_close': '开' if offset_flag == 'open' else '平',
             'offset_flag': offset_flag,
             'allocation_source': allocation_source,
             'price': price,
             'volume': volume,
-            'trade_time': getattr(trade, 'datetime', '') or '',
+            'trade_time': dt_str,
             'account': account,
             'exchange': exchange,
             'trading_day': trading_day,
+            'cost_price': 0.0,
+            'cost_basis': 'n/a',
+            'realized_pnl': 0.0,
         }
         ledger_key = tuple(record['ledger_key'])
         _TRADE_CACHE.setdefault(ledger_key, []).append(record)
 
-        # P0-6: 平仓时计算 realized PnL 并累加
+        # 开仓 → 累加今日开仓加权成本（今开腿的 pnl 基准 / 平今成本）
+        if offset_flag == 'open':
+            _accum_open_cost(record)
+
+        # P0-6/F2: 平仓时计算 realized PnL 并累加
+        # 成本基准（盯市口径，与老系统一致）：
+        #   平昨：昨结算价 → 今开加权 → 结算单开仓均价 → 成交价（告警，盈亏记 0）
+        #   平今：今开加权 → 昨结算价 → 结算单开仓均价 → 成交价（告警）
         if offset_flag != 'open' and price > 0 and volume > 0:
-            direction_sign = 1 if position_direction == '多' else -1
+            direction_sign = 1 if position_direction == 'long' else -1
             sym = symbol
-            # cost_price 从 _shared_state["settlement_dict"] 读取（key 带方向）
             with _shared_lock:
                 cost_dict = dict(_shared_state.get('settlement_dict', {}))
-            cost_key = f"{sym}_{position_direction}"
-            cost_price = cost_dict.get(cost_key, price)  # 降级用成交价
-            # 估算 size（从 _shared_state 的 contracts 获取）
-            size = 1
-            try:
-                with _shared_lock:
-                    c = _shared_state.get('contracts', {})
-                    if sym in c:
-                        size = c[sym].get('size', 1)
-            except Exception:
-                pass
+                settle_dict = dict(_shared_state.get('settlement_prices', {}))
+                c = _shared_state.get('contracts', {}).get(sym, {})
+            size = c.get('size', 1) or 1
+            if not c:
+                logger.warning(f"[_on_trade] {sym} 合约信息未就绪，size 暂按 1（已实现盈亏可能偏小）")
+            prev_settle = float(settle_dict.get(sym) or 0.0)
+            open_cost = float(_open_cost_map().get(f"{sym}_{position_direction}") or 0.0)
+            avg_cost = float(cost_dict.get(f"{sym}_{position_direction}") or 0.0)
+            if offset_flag == 'close_today':
+                ladder = ((open_cost, 'today_open_cost'), (prev_settle, 'prev_settlement'),
+                          (avg_cost, 'settlement_open_cost'))
+            else:
+                ladder = ((prev_settle, 'prev_settlement'), (open_cost, 'today_open_cost'),
+                          (avg_cost, 'settlement_open_cost'))
+            cost_price, cost_basis = 0.0, ''
+            for _v, _b in ladder:
+                if _v > 0:
+                    cost_price, cost_basis = _v, _b
+                    break
+            if cost_price <= 0:
+                cost_price, cost_basis = price, 'unknown_use_trade_price'
+                logger.warning(f"[_on_trade] {sym} 无任何成本基准（归因 {allocation_source}），已实现按 0 计")
             pnl_realized = direction_sign * (price - cost_price) * volume * size
+            record['cost_price'] = round(cost_price, 6)
+            record['cost_basis'] = cost_basis
+            record['realized_pnl'] = round(pnl_realized, 2)
             _REALIZED_PNL_CACHE[sym] = _REALIZED_PNL_CACHE.get(sym, 0.0) + pnl_realized
-            logger.debug(f"[_on_trade] realized pnl {sym}: {pnl_realized:.2f}, running total: {_REALIZED_PNL_CACHE[sym]:.2f}")
+            logger.info(f"[_on_trade] {sym} {offset_flag} {volume}手@{price} "
+                        f"成本{cost_price}({cost_basis}) → realized {pnl_realized:.2f}，"
+                        f"累计 {_REALIZED_PNL_CACHE[sym]:.2f}")
+
+        _save_trade_ledger()
 
     except Exception:
         logger.exception("[_on_trade] 处理成交回报异常")
@@ -341,7 +526,12 @@ def _register_trade_event(eng: VNPYEngine):
     """将 _on_trade 注册到 vnpy 事件引擎。"""
     try:
         from vnpy.trader.event import EVENT_TRADE
-        eng.event_engine.register(EVENT_TRADE, _on_trade)
+        # event_engine 不是 VNPYEngine 的属性，挂在 MainEngine 上
+        me = getattr(eng, "main_engine", None)
+        if me is None or not hasattr(me, "event_engine"):
+            logger.warning("[_register_trade_event] main_engine/event_engine 未就绪，成交回报未注册")
+            return
+        me.event_engine.register(EVENT_TRADE, _on_trade)
         logger.info("[_register_trade_event] EVENT_TRADE 注册成功")
     except Exception as e:
         logger.warning(f"[_register_trade_event] EVENT_TRADE 注册失败: {e}")
@@ -352,7 +542,7 @@ def _worker_loop(settlement_dir: str):
     CTP Worker 主循环（连接 + 重连阶梯 + 轮询 + 自动快照）：
     - 外层：连接/重连循环。连接失败按 fast(3s×10)→idle(30min) 阶梯重试。
     - 内层：connected 后每秒轮询持仓；探测到掉线（login_status=False）→ 丢弃旧引擎，break 回外层重连。
-    - 自动快照只在内层 _poll_once 成功后调 _maybe_auto_save()（内部还有 ctp_status==connected 守卫）。
+    - 收盘快照只在内层 _poll_once 成功后调 _close_snapshot_step()（内部还有 ctp_status==connected 守卫）。
       重连与快照解耦：本模块只负责让 engine 活着，快照只读 ctp_status 作数据边界。
     """
 
@@ -382,12 +572,15 @@ def _worker_loop(settlement_dir: str):
     if _settlement_manager is None:
         _settlement_manager = SettlementManager()
         _settlement_manager.load_costs_from_meta()
+    # F2: 重启后重放成交账本（当日已实现盈亏不因重启归零）
+    _load_trade_ledger(_ctp_trading_day())
     _local_complete = (
         len(_settlement_manager._cost_cache) > 0
         and _settlement_manager._meta.get("loaded", False)
     )
 
     def _do_settlement_sync():
+        nonlocal _local_complete
         try:
             # 本地数据齐全时，跳过网络请求
             if _local_complete:
@@ -478,7 +671,7 @@ def _worker_loop(settlement_dir: str):
                     logger.exception("[_poll_once] 异常")
                     import traceback
                     logger.info(f"[_poll_once] traceback: {traceback.format_exc()}")
-                _maybe_auto_save()
+                _close_snapshot_step()
                 _ctp_stop_event.wait(1.0)
             continue  # 回到外层重连阶梯
 
@@ -514,11 +707,25 @@ def _worker_loop(settlement_dir: str):
 
 def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dict):
     """单次轮询：读取持仓 → 订阅行情 → 计算 Greeks → 写共享状态"""
-    global _engine
+    global _engine, _RECEIVED_TODAY_DATE, _RECEIVED_TODAY, _SEEN_NONEMPTY_POS
     _engine = engine
+
+    # ── P0-8 补充：交易日切换 → 重置 received_today ────────────────────────────
+    current_session, current_day = _current_session()
+    # F2: 账本分区以 CTP TradingDay 为权威（本机 clock 只作兜底，不用于账务）
+    _ctp_day = _ctp_trading_day()
+    if _ctp_day:
+        _rollover_trading_day(_ctp_day)
+    if current_day and current_day != _RECEIVED_TODAY_DATE:
+        if _RECEIVED_TODAY:
+            logger.info(f"[received_today] 交易日切换 {_RECEIVED_TODAY_DATE} → {current_day}，重置行情推送标记")
+        _RECEIVED_TODAY_DATE = current_day
+        _RECEIVED_TODAY.clear()
 
     # ── 读取持仓 ──────────────────────────────────────────────────────────────
     raw_positions = engine.query_positions()
+    if raw_positions:
+        _SEEN_NONEMPTY_POS = True   # 真空仓佐证：本连接内曾见非空持仓，之后变空才算真平仓
     logger.info(f"[_poll_once] query_positions() 返回 {len(raw_positions)} 条持仓")
 
     # ── 订阅行情 + 收集标的 ───────────────────────────────────────────────────
@@ -631,10 +838,21 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             if tick and tick.last_price != 0:
                 # P0-8: 事件驱动开盘标记（收到 tick = 开盘）
                 sym = pos.vt_symbol.split('.')[0]
+                ts = getattr(tick, 'datetime', None)
                 if sym not in _OPENED_CONTRACTS:
-                    ts = getattr(tick, 'datetime', None)
                     ts_str = str(ts)[11:19] if ts else datetime.datetime.now().strftime('%H:%M:%S')
                     _OPENED_CONTRACTS[sym] = {'first_tick': ts_str}
+                # P0-8 补充：收到 tick → 转换为交易日 → 记录今日行情推送
+                if ts is not None:
+                    tick_session, tick_day = _current_session(ts)
+                    if tick_day == _RECEIVED_TODAY_DATE:
+                        _RECEIVED_TODAY[sym] = True
+                        # 品种级标记：该期权所属品种（und）所有合约开始计算
+                        if und:
+                            _RECEIVED_TODAY[und] = True
+                            # CFFEX MO/IM 互映射：MO 合约进来也标记 IM
+                            if und.startswith("MO"):
+                                _RECEIVED_TODAY["IM" + und[2:]] = True
                 option_ticks[pos.vt_symbol] = {
                     "last_price":   tick.last_price,
                     "bid_price_1":  getattr(tick, "bid_price_1", 0) or 0,
@@ -659,14 +877,28 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
     for pos, contract in futures_positions:
         ft = engine.query_tick(pos.vt_symbol, timeout=None)
         lp = 0.0
+        ft_dt = None
         if ft:
             lp = ft.last_price or (getattr(ft, "pre_close", 0) or 0)
+            ft_dt = getattr(ft, "datetime", None)
+        sym = pos.vt_symbol.split('.')[0]
+        # 品种级标记：futures 的品种 = 合约主符号（如 CU/AU/NI/IM 期货品种）
+        # 提取品种前缀：2字母（CU/AU/NI/IM 等）或 1字母（J/M/RU 等），数字前部分
+        import re
+        m = re.match(r'^([A-Z]{1,2})', sym)
+        species = m.group(1) if m else sym
+        if ft_dt is not None:
+            tick_session, tick_day = _current_session(ft_dt)
+            if tick_day == _RECEIVED_TODAY_DATE:
+                _RECEIVED_TODAY[sym] = True
+                _RECEIVED_TODAY[species] = True
         option_ticks[pos.vt_symbol] = {
             "last_price":       lp,
             "bid_price_1":      0,
             "ask_price_1":      0,
             "underlying_price": lp,
             "iv":               None,
+            "datetime":         ft_dt,
         }
 
     # 调用 price_options_batch（纯函数，无 engine 依赖）
@@ -808,36 +1040,17 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
     settlement_cost_dict  = settlement_data
     settlement_prices_dict = settlement_prices
 
-    # ── settlement_cost_dict 方向 key 统一为英文（calc_pnl 用英文 key 查找）───────
-    _DIR_MAP_CN_TO_EN = {"多": "long", "空": "short"}
-    settlement_cost_dict_en = {}
-    for key, value in settlement_cost_dict.items():
-        # key 格式: "IC2609_多" / "IC2609_空" / "IC2609"（无方向后缀）
-        parts = key.rsplit('_', 1)
-        if len(parts) == 2 and parts[1] in _DIR_MAP_CN_TO_EN:
-            sym, direction_cn = parts
-            direction_en = _DIR_MAP_CN_TO_EN[direction_cn]
-            settlement_cost_dict_en[f"{sym}_{direction_en}"] = value
-        else:
-            settlement_cost_dict_en[key] = value  # 无方向后缀的原样保留
-
     # ── 加载昨快照（adjust_price）──────────────────────────────────────────────
     # calc_pnl 期望格式: {f"{sym}_{direction}": {"adjust_price": float}}
-    # 方向: settlement_cost_dict 用中文("多"/"空")，calc_pnl 用英文("long"/"short")
-    # 昨快照 direction 是中文，需转英文与 calc_pnl 查找格式对齐
-    raw_yesterday = _load_yesterday_snapshot()
-    yesterday_snapshot = {}
-    _DIR_MAP = {"多": "long", "空": "short"}
-    for (sym, direction_cn), adj_price in raw_yesterday.items():
-        direction_en = _DIR_MAP.get(direction_cn, direction_cn)
-        yesterday_snapshot[f"{sym}_{direction_en}"] = {"adjust_price": adj_price}
+    # yesterday_snapshot key 已在 _load_yesterday_snapshot 中构建为英文
+    yesterday_snapshot = _load_yesterday_snapshot()
 
     # ── 写共享状态 ────────────────────────────────────────────────────────────
     # build_tree 是纯函数，需要 ticks + contracts + settlement_dict
     try:
         tree = build_tree(positions_out, ticks, contracts,
                           settlement_cost_dict, settlement_prices_dict,
-                          yesterday_snapshot)
+                          yesterday_snapshot, _RECEIVED_TODAY, _open_cost_map())
     except Exception:
         import traceback
         tree = {"summary": {}, "tree": []}
@@ -849,22 +1062,26 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             f.write(traceback.format_exc())
             f.write("\n")
     logger.info(f"[_poll_once] positions_out={len(positions_out)}, contracts={len(contracts)}, tree_nodes={len(tree.get('tree',[]))}, yesterday_snapshot_keys={len(yesterday_snapshot)}, settlement_prices_keys={len(settlement_prices_dict)}")
-    with open(_os.path.join(_parent_dir, "_debug_pnl.log"), "a") as f:
-        f.write(f"=== {datetime.datetime.now()} ===\n")
-        f.write(f"yesterday_snapshot count={len(yesterday_snapshot)}\n")
-        # 检查 au2610P904_short 的 lookup
-        test_key = "au2610P904_short"
-        f.write(f"  yesterday_snapshot['{test_key}'] = {yesterday_snapshot.get(test_key)}\n")
-        # 检查 settlement_prices 是否有标的
-        f.write(f"  settlement_prices count={len(settlement_prices_dict)}\n")
+
+    # F1: 基准来源可见性——昨收盘快照以外的降级腿计数发生变化时告警一次（不每轮刷屏）
+    global _BASIS_WARN_SIGNATURE
+    _counts = (tree.get("summary") or {}).get("pnl_basis_counts") or {}
+    _sig = json.dumps(_counts, sort_keys=True)
+    if _sig != _BASIS_WARN_SIGNATURE:
+        _BASIS_WARN_SIGNATURE = _sig
+        _bad = {k: v for k, v in _counts.items() if k != "prev_close_snapshot"}
+        if _bad:
+            logger.warning(f"[pnl基准] 非昨收盘快照基准腿 计数={_bad}（快照基准 "
+                           f"{_counts.get('prev_close_snapshot', 0)} 腿）—— 见基线 §3.7 降级链")
 
     # P0-6: 汇总已实现 PnL（_realized_pnl_cache）追加到 summary
     # 全平合约从 tree 消失，但其 realized PnL 必须进入当日和历史汇总
     total_realized = sum(_REALIZED_PNL_CACHE.values())
     if total_realized != 0:
         if tree.get("summary"):
-            tree["summary"]["pnl_today"] = round(tree["summary"].get("pnl_today", 0) + total_realized, 2)
-            tree["summary"]["pnl_history"] = round(tree["summary"].get("pnl_history", 0) + total_realized, 2)
+            # _make_summary 的键名是 total_*，注入必须对齐，否则写进无人消费的野键
+            tree["summary"]["total_pnl_today"] = round(tree["summary"].get("total_pnl_today", 0) + total_realized, 2)
+            tree["summary"]["total_pnl_history"] = round(tree["summary"].get("total_pnl_history", 0) + total_realized, 2)
         logger.debug(f"[_poll_once] realized_pnl accumulated: {total_realized:.2f}")
 
     with _shared_lock:
@@ -925,23 +1142,17 @@ def _current_session(dt: datetime.datetime = None):
         dt = datetime.datetime.now()
     h = dt.hour + dt.minute / 60.0
 
+    # 窗口右端各放宽 6min：收盘（11:30/15:00/02:30）之后仍留一次落盘机会，以取到收盘截面
+    # ponytail: 30min 周期不保证正好落在窗口尾 6min 内；若仍取不到收盘价，再加"窗口尾强制写"
     if 20.0 <= h < 24.0:
         return ("N", (dt + datetime.timedelta(days=1)).strftime("%Y%m%d"))
-    if 0.0 <= h < 2.5:
+    if 0.0 <= h < 2.6:
         return ("N", dt.strftime("%Y%m%d"))
-    if 8.0 <= h < 11.5:
+    if 8.0 <= h < 11.6:
         return ("A", dt.strftime("%Y%m%d"))
-    if 12.0 <= h < 15.0:
+    if 12.0 <= h < 15.1:
         return ("P", dt.strftime("%Y%m%d"))
     return (None, None)
-
-
-def _snapshot_name_for(dt: datetime.datetime = None):
-    """返回 (filename, business_date, session)，窗口外 filename=None"""
-    session, business_date = _current_session(dt)
-    if not session:
-        return (None, None, None)
-    return (f"data_snapshot_{business_date}_{session}.json", business_date, session)
 
 
 def _positions_hash(positions):
@@ -958,111 +1169,179 @@ def _ensure_snapshot_dir():
     _os.makedirs(_SNAPSHOT_DIR, exist_ok=True)
 
 
-def _load_yesterday_snapshot() -> dict:
-    """
-    加载前一交易日尾盘快照，提取叶子合约的 adjust_price。
-    返回 {(symbol, direction): adjust_price} 字典。
-    快照 tree 为嵌套结构，叶子节点含 adjust_price 和 direction（中文"多"/"空"）。
-    """
-    today = datetime.datetime.now()
-    yesterday = today - datetime.timedelta(days=1)
-    filename = f"data_snapshot_{yesterday.strftime('%Y%m%d')}_P.json"
-    filepath = _snapshot_path(filename)
+def _business_date(dt: datetime.datetime) -> str:
+    """业务日：20:00 后归次日，其余归当日（与 _current_session 的夜盘规则一致）。
+    ponytail: 仍由本机 clock 推导，未取 CTP TradingDay；升级路径 = 从 engine 读 trading_day。"""
+    if dt.hour >= 20:
+        return (dt + datetime.timedelta(days=1)).strftime("%Y%m%d")
+    return dt.strftime("%Y%m%d")
 
-    if not _os.path.isfile(filepath):
-        logger.warning(f"[_load_yesterday_snapshot] 快照不存在: {filepath}")
-        return {}
 
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        logger.warning(f"[_load_yesterday_snapshot] 读文件失败: {e}")
-        return {}
+# ── 收盘快照（v1.4）：每业务日一份，基准 = 14:55–15:00 Mark 算术平均 ──────────
 
-    result = {}
+# 快照叶子 direction 的两种写法（中文/英文）统一映射到 calc_pnl 的查找键
+_DIR_MAP = {"多": "long", "空": "short", "long": "long", "short": "short"}
 
-    def extract_leaves(nodes):
-        for node in nodes:
+# 昨收基准按业务日缓存：避免每轮 poll 重解析整份快照 JSON
+_BASE_CACHE: dict = {"bd": "", "result": {}}
+
+
+def _close_snapshot_name(bd: str) -> str:
+    return f"{_CLOSE_PREFIX}{bd}{_SNAPSHOT_EXT}"
+
+
+def _close_dates() -> dict:
+    """{业务日: 文件名}，只认 close_snapshot_*；历史 data_snapshot_* 一律不读，留盘审计。"""
+    _ensure_snapshot_dir()
+    out = {}
+    for name in _os.listdir(_SNAPSHOT_DIR):
+        if not name.startswith(_CLOSE_PREFIX) or not name.endswith(_SNAPSHOT_EXT):
+            continue
+        d = name[len(_CLOSE_PREFIX):-len(_SNAPSHOT_EXT)]
+        if len(d) == 8 and d.isdigit():
+            out[d] = name
+    return out
+
+
+def _leaf_marks(tree_nodes) -> dict:
+    """从 tree 提取 L3 叶子 {f"{sym}_{direction}": adjust_price}（Mark；期权与期货同字段）"""
+    out = {}
+
+    def walk(nodes):
+        for node in nodes or []:
             children = node.get("children")
             if children:
-                extract_leaves(children)
-            else:
-                sym = node.get("symbol")
-                if not sym:
-                    continue
-                direction_cn = node.get("direction", "")
-                # 快照叶子节点 direction 为中文 "多"/"空"，需与 settlement_cost_dict key 格式保持一致
-                if direction_cn in ("多", "空"):
-                    direction = direction_cn  # 中文原样，不转英文
-                else:
-                    continue
-                adj_price = node.get("adjust_price")
-                if adj_price is not None:
-                    result[(sym, direction)] = adj_price
+                walk(children)
+                continue
+            sym = node.get("symbol")
+            d = _DIR_MAP.get(node.get("direction", ""))
+            if sym and d:
+                out[f"{sym}_{d}"] = node.get("adjust_price")
 
-    extract_leaves(data.get("computed", {}).get("tree", []))
-    logger.info(f"[_load_yesterday_snapshot] 从 {filename} 提取 {len(result)} 条 adjust_price")
+    walk(tree_nodes)
+    return out
+
+
+def _prev_trading_day_file(bd: str):
+    """T-1 业务日的收盘快照文件名；无则 None（不跨业务日回退，基准降级结算价）。
+    T-1 以结算单有效日期为准（`_valid_dates()` 是系统内唯一有实据的交易日历，
+    与结算价降级同一参照系）；结算单不可用时退化为目录里 < 今日 的最大日期并 WARNING。"""
+    older = {d: n for d, n in _close_dates().items() if d < bd}
+    if not older:
+        return None
+    try:
+        ref = max((d for d in _valid_dates() if d < bd), default="")
+    except Exception as e:
+        logger.warning(f"[close_snapshot] 读结算单交易日历失败: {e}")
+        ref = ""
+    if ref:
+        return older.get(ref)     # T-1 无快照 → None，由 calc_pnl 降级昨结算价
+    d = max(older)
+    logger.warning(f"[close_snapshot] 结算单交易日历不可用，T-1 退化为最近快照 {d}")
+    return older[d]
+
+
+def _load_yesterday_snapshot() -> dict:
+    """
+    加载上一交易日收盘快照的 leaves，返回 {f"{sym}_{direction}": {"adjust_price": p}}。
+    只认 T-1 的 close_snapshot_*（14:55–15:00 Mark 算术平均，price_basis=close_avg）：
+    不跨业务日回退、不读历史 data_snapshot_*（盘中价/末价冒充昨收即为错误基准）。
+    无 T-1 快照 → 返回 {} → calc_pnl 降级昨结算价 → 再 None。
+    """
+    bd = _business_date(datetime.datetime.now())
+    if _BASE_CACHE["bd"] == bd:
+        return _BASE_CACHE["result"]
+
+    result = {}
+    fname = _prev_trading_day_file(bd)
+    if not fname:
+        logger.warning(f"[_load_yesterday_snapshot] 无 T-1（{bd}）收盘快照 → 基准降级结算价")
+    else:
+        try:
+            with open(_snapshot_path(fname), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for key, leaf in (data.get("leaves") or {}).items():
+                if not isinstance(leaf, dict):
+                    continue
+                if leaf.get("price_basis") != "close_avg":
+                    logger.warning(f"[_load_yesterday_snapshot] {key} price_basis="
+                                   f"{leaf.get('price_basis')!r} 非 close_avg，拒作基准")
+                    continue
+                p = leaf.get("adjust_price")
+                if isinstance(p, (int, float)) and p == p and p > 0:
+                    result[key] = {"adjust_price": float(p)}
+            logger.info(f"[_load_yesterday_snapshot] 基准快照={fname}，提取 {len(result)} 条收盘 Mark")
+        except Exception as e:
+            logger.warning(f"[_load_yesterday_snapshot] 读 {fname} 失败: {e}")
+
+    _BASE_CACHE["bd"], _BASE_CACHE["result"] = bd, result
     return result
 
 
-# ── 自动快照模块（与重连模块解耦：只读 _shared_state["ctp_status"] 作数据边界）──
-# 触发：connected 且（时段边界 或 距上次满 30min）
-# 落盘：positions hash 与旧文件不同才覆盖；时段边界强制覆盖；连接中的真空仓亦存
-_SNAP_INTERVAL = 30 * 60          # 秒
-_snap_state = {
-    "last_ts": 0.0,               # 上次尝试时间（time.time()）
-    "last_key": None,             # 上次 (业务日, session)
-}
-
-
-def _maybe_auto_save():
+def _close_snapshot_step():
     """
-    自动保存当前快照 → 快照/data_snapshot_{业务日}_{session}.json（单文件覆盖）。
-    守护1：仅 ctp_status == "connected" 才存 → 掉线期/重连期绝不覆盖好数据。
-    守护2：窗口外（无 session）不存。
-    守护3：数据未变且非时段边界 → 跳过（空仓首次仍会写）。
+    收盘快照调度（v1.4）：14:55–15:00 每轮 poll 记一次 Mark；15:00 后第一轮落盘。
+    守护1：仅 ctp_status == connected。
+    守护2：采样窗内只采样；15:00–15:10 内且该业务日未写才尝试落盘（失败可重试）。
+    守护3：持仓为空且本连接内未见过非空持仓 → 判数据通信未就绪，不落盘。
+    守护4：采样窗错过（缓冲为空）→ 放弃当日并 WARNING，T+1 降级结算价。
     """
+    global _SAMPLE_BD
     snap = _snapshot()
     if snap["ctp_status"] != "connected":
-        return  # 连接守卫：掉线/重连期不落盘
-
-    now = datetime.datetime.now()
-    filename, business_date, session = _snapshot_name_for(now)
-    if not filename:
-        return  # 非交易窗口
-
-    key = (business_date, session)
-    now_ts = time.time()
-    boundary = (key != _snap_state["last_key"])
-    if not boundary and (now_ts - _snap_state["last_ts"]) < _SNAP_INTERVAL:
         return
 
+    now = datetime.datetime.now()
+    t = now.time()
+    bd = _business_date(now)
+    if bd != _SAMPLE_BD:
+        _MARK_SAMPLES.clear()
+        _SAMPLE_BD = bd
+
+    if _CLOSE_SAMPLE_START <= t < _CLOSE_SAMPLE_END:
+        for key, mark in _leaf_marks(snap["tree"]).items():
+            if mark is not None:
+                _MARK_SAMPLES.setdefault(key, []).append(mark)
+        return
+
+    if _CLOSE_SAMPLE_END <= t <= _CLOSE_RETRY_END and bd not in _CLOSE_SAVED:
+        _save_close_snapshot(snap, bd, now)
+
+
+def _save_close_snapshot(snap, bd: str, now: datetime.datetime):
+    """写 close_snapshot_{bd}.json：leaves.adjust_price = 窗口内 Mark 算术平均（不去重、不加权）。"""
     positions = snap["positions"]
-    data_hash = _positions_hash(positions)
+    if not positions and not _SEEN_NONEMPTY_POS:
+        logger.warning("[close_snapshot] 持仓为空且本连接内未见过非空持仓，判数据通信未就绪 → 不落盘")
+        return
+    if not _MARK_SAMPLES:
+        logger.warning("[close_snapshot] 采样缓冲为空（14:55–15:00 服务未运行？）"
+                       "→ 本日无收盘快照，T+1 降级结算价")
+        _CLOSE_SAVED.add(bd)
+        return
 
-    _ensure_snapshot_dir()
-    filepath = _snapshot_path(filename)
-
-    # 非时段边界 + 数据未变 → 跳过写盘
-    if not boundary and _os.path.isfile(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                old = json.load(f)
-            if old.get("data_hash") == data_hash:
-                _snap_state["last_ts"] = now_ts
-                return
-        except Exception:
-            pass
+    last = _leaf_marks(snap["tree"])
+    leaves = {}
+    for key, samples in _MARK_SAMPLES.items():
+        if not samples:
+            continue
+        leaf = {"adjust_price": round(sum(samples) / len(samples), 4),
+                "price_basis": "close_avg",
+                "samples": len(samples)}
+        if last.get(key) is not None:
+            leaf["last_price"] = last[key]
+        leaves[key] = leaf
 
     payload = {
-        "version": 3,
+        "version": 4,
+        "trading_date": bd,
         "saved_at": now.isoformat(),
-        "trading_date": business_date,
-        "session": session,
+        "window": {"start": _CLOSE_SAMPLE_START.strftime("%H:%M:%S"),
+                   "end": _CLOSE_SAMPLE_END.strftime("%H:%M:%S")},
         "ctp_status": snap["ctp_status"],
-        "snapshot_kind": "empty" if not positions else "live",  # P0-8
-        "data_hash": data_hash,
+        "snapshot_kind": "empty" if not positions else "live",
+        "data_hash": _positions_hash(positions),
+        "leaves": leaves,
         "raw": {
             "positions": positions,
             "underlying_prices": snap["underlying_prices"],
@@ -1073,30 +1352,34 @@ def _maybe_auto_save():
         },
         "account": snap["account"],
     }
+    _ensure_snapshot_dir()
+    filepath = _snapshot_path(_close_snapshot_name(bd))
     try:
         tmp = filepath + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            json.dump(_clean_nan(payload), f, ensure_ascii=False, indent=2)
         _os.replace(tmp, filepath)   # 原子替换，避免读到半截文件
-        _snap_state["last_ts"] = now_ts
-        _snap_state["last_key"] = key
-    except Exception:
-        pass
+        _CLOSE_SAVED.add(bd)
+        _MARK_SAMPLES.clear()
+        logger.info(f"[close_snapshot] 已落盘 {filepath}：{len(leaves)} 条收盘 Mark，"
+                    f"持仓 {len(positions)} 条")
+    except Exception as e:
+        logger.warning(f"[close_snapshot] 写盘失败（15:00–15:10 内重试）: {e}")
 
 
 @api_bp.route("/snapshot/save", methods=["POST"])
 def api_snapshot_save():
-    """手动保存当前持仓快照到固定文件（覆盖写）。返回 {"message":"快照已保存","status":"ok"}。"""
+    """手动保存当前持仓快照到固定文件（覆盖写，仅供调试/取数，不作基准）。
+    返回 {"message":"快照已保存","status":"ok"}。"""
     try:
         snap = _snapshot()
         now = datetime.datetime.now()
-        _, business_date, session = _snapshot_name_for(now)
         payload = {
-            "version": 3,
+            "version": 4,
             "saved_at": now.isoformat(),
-            "trading_date": business_date,
-            "session": session,
+            "trading_date": _business_date(now),
             "ctp_status": snap["ctp_status"],
+            "leaves": _leaf_marks(snap["tree"]),
             "raw": {
                 "positions": snap["positions"],
                 "underlying_prices": snap["underlying_prices"],
@@ -1111,7 +1394,7 @@ def api_snapshot_save():
         filepath = _os.path.join(_SNAPSHOT_DIR, "data_snapshot_current.json")
         tmp = filepath + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            json.dump(_clean_nan(payload), f, ensure_ascii=False, indent=2)
         _os.replace(tmp, filepath)
         return jsonify({"status": "ok", "message": "快照已保存"})
     except Exception as e:
@@ -1120,11 +1403,12 @@ def api_snapshot_save():
 
 @api_bp.route("/snapshots", methods=["GET"])
 def api_snapshots_list():
-    """列出快照目录内所有快照，返回 [{name, trading_date, session, saved_at, position_count}]"""
+    """列出快照目录内所有快照（收盘快照 + 历史时段快照），
+    返回 [{name, kind, trading_date, session, saved_at, position_count, leaves, price_basis}]"""
     _ensure_snapshot_dir()
     files = sorted(
         f for f in _os.listdir(_SNAPSHOT_DIR)
-        if f.startswith(_SNAPSHOT_PREFIX) and f.endswith(_SNAPSHOT_EXT)
+        if f.endswith(_SNAPSHOT_EXT) and (f.startswith(_CLOSE_PREFIX) or f.startswith(_SNAPSHOT_PREFIX))
     )
     result = []
     for fname in files:
@@ -1132,13 +1416,18 @@ def api_snapshots_list():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
+            leaves = d.get("leaves") or {}
+            bases = {v.get("price_basis") for v in leaves.values() if isinstance(v, dict)}
             result.append({
                 "name": fname,
+                "kind": "close" if fname.startswith(_CLOSE_PREFIX) else "legacy",
                 "trading_date": d.get("trading_date", ""),
                 "session": d.get("session", ""),
                 "saved_at": d.get("saved_at", ""),
                 "position_count": len(d.get("raw", {}).get("positions", [])),
                 "ctp_status": d.get("ctp_status", ""),
+                "leaves": len(leaves),
+                "price_basis": ",".join(sorted(b for b in bases if b)),
             })
         except Exception:
             pass
@@ -1411,7 +1700,8 @@ def _stop_worker():
 
 # ── App Factory ──────────────────────────────────────────────────────────────
 
-def create_app(settlement_dir: str = "结算单", static_folder=None, template_folder=None) -> Flask:
+def create_app(settlement_dir: str = "结算单", static_folder=None, template_folder=None,
+                instance_info: Optional[dict] = None) -> Flask:
     """
     创建 Flask 应用
 
@@ -1429,6 +1719,40 @@ def create_app(settlement_dir: str = "结算单", static_folder=None, template_f
         template_folder = _os.path.join(_project_root, "templates")
 
     app = Flask(__name__, static_folder=static_folder, template_folder=template_folder)
+
+    # 实例信息（单实例管理用）
+    _instance_info = instance_info or {}
+
+    # ── /api/health ──────────────────────────────────────────────────────────────
+    @app.route("/api/health")
+    def _health():
+        """健康检查 + 实例信息，供 Mutex 冲突时远程探测"""
+        with _shared_lock:
+            ctp = _shared_state.get("ctp_status", "unknown")
+            worker = _shared_state.get("worker_alive", False)
+        info = {
+            "status": "running",
+            "pid": _os.getpid(),
+            "instance": _instance_info or {},
+            "ctp_status": ctp,
+            "worker_alive": worker,
+        }
+        return jsonify(info)
+
+    # ── /api/shutdown ─────────────────────────────────────────────────────────────
+    @app.route("/api/shutdown", methods=["POST"])
+    def _shutdown():
+        """受控停止服务（必须 POST）"""
+        import signal as _signal
+        # 改状态
+        _shared_state["instance_status"] = "stopping"
+        # 通知 atexit 清理
+        def _deferred_shutdown():
+            import os as _os
+            _os.kill(_os.getpid(), _signal.SIGTERM)
+        import threading as _t
+        _t.Thread(target=_deferred_shutdown, daemon=True).start()
+        return jsonify({"message": "shutdown scheduled"})
 
     # 注册 API Blueprint
     app.register_blueprint(api_bp)

@@ -124,5 +124,5 @@ ERROR：0
 | vegacash | pos_vega × size |
 | thetacash | pos_theta × size |
 |不掉线不close | CtpTdApi.exit()持GIL会冻死解释器，永远不调；掉线→_engine=None+break→外层重建 |
-| pnl_daily | 盯日盈亏：last_price 对比昨日 adjust_price（昨收） |
-| 前端列 | 18列，删 direction；COL_DEF 单一数据源 |
+| 前端列 | 17列（v1.5 删「盯日盈亏」），删 direction；COL_DEF 单一数据源 |
+| ~~pnl_daily~~ | **v1.5 已删除该口径**，PnL 只剩 pnl_today / pnl_history；当日盈亏基准链见基线 §3.7 |

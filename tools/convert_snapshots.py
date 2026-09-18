@@ -61,7 +61,6 @@ def _l3_from_old(pos: dict) -> dict:
         "deltacash": dc, "gammacash": gc,
         "vegacash": pos.get("vegacash", 0) or 0,
         "thetacash": pos.get("thetacash", 0) or 0,
-        "pnl_daily": pos.get("pnl_daily", 0) or 0,
         "pnl_today": pos.get("pnl_today", 0) or 0,
         "pnl_history": ph,
         "delta_tag": tag_delta(dc),
@@ -211,7 +210,6 @@ def convert(old_dir=_OLD_DIR, new_dir=_NEW_DIR, files=None, force=False):
             "file": dst_name, "positions": len(positions),
             "products": len(built["tree"]),
             "total_deltacash": s["total_deltacash"],
-            "total_pnl_daily": s["total_pnl_daily"],
             "total_pnl_today": s["total_pnl_today"],
             "total_pnl_history": s["total_pnl_history"],
         })
@@ -232,7 +230,7 @@ if __name__ == "__main__":
             d = json.load(f)
         s = d["computed"]["summary"]
         for k, mk in (("deltacash", "total_deltacash"), ("gammacash", "total_gammacash"),
-                      ("pnl_daily", "total_pnl_daily"), ("pnl_history", "total_pnl_history")):
+                      ("pnl_today", "total_pnl_today"), ("pnl_history", "total_pnl_history")):
             acc = sum(n["metrics"][k] for n in d["computed"]["tree"])
             assert acc == s[mk], (r["file"], k, acc, s[mk])
     print("自检通过: L1 聚合 == summary")

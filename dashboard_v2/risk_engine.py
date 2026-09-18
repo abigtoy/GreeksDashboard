@@ -6,6 +6,7 @@ from dashboard_v2.pricing import black76
 from dashboard_v2.settlement import load_settlement_cost
 
 import math
+import datetime
 import re
 from collections import defaultdict
 
@@ -208,66 +209,108 @@ def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
 # =======================================================================
 # 3.5 PnL 三口径（含新开仓/已平仓处理）
 # =======================================================================
+def _is_no_tick(tick: dict) -> bool:
+    """
+    "无行情" 判定 —— 当日盈亏的准入门槛。两种情形都算无行情：
+      1) tick 为 None 或无最新价（缓存空、query_tick 超时返回 None）
+      2) tick.datetime 不是今天（重连后 vnpy 缓存里的往日报价：有价但非今日推送）
+    理由：这两类价都不能证明"今天这个合约的盈亏变化"，计入会把陈旧成本基准当今日盈亏。
+    ponytail: 自然日近似 CTP 交易日，跨零点的夜盘品种（sc/au 等）在 00:00 后会被判无行情；
+              升级路径 = 注入 trading_day 参数替代本机 date()。
+    """
+    if not tick:
+        return True
+    if not (tick.get('last_price') or tick.get('price')):
+        return True
+    dt = tick.get('datetime')
+    if dt is not None and dt.date() != datetime.date.today():
+        return True
+    return False
+
+
 def calc_pnl(position: dict, contract: dict, tick: dict,
              settlement_dict: dict,
              settlement_prices: dict = None,
-             yesterday_snapshot: dict = None) -> dict:
-    """contract: 合约元数据，含 size（乘数），必须传入，VNPY PositionData 无 size 字段。"""
+             yesterday_snapshot: dict = None,
+             received_today: dict = None,
+             today_open_cost: dict = None) -> dict:
+    """contract: 合约元数据，含 size（乘数），必须传入，VNPY PositionData 无 size 字段。
+    无行情（_is_no_tick）或无今日基准 → pnl_today=None：不显示、不参与账户汇总、不写 NaN。
+    today_open_cost: {f"{sym}_{direction}" → 今日账本开仓加权价}，供今开仓腿取基准/成本。
+    返回附带 price_basis（当日盈亏基准来源）与 cost_basis（开仓成本来源），供降级告警与核对。
+    """
     sym = position['symbol'].split('.')[0]
-    direction_str  = '多' if position['direction'] in ('long', '多') else '空'
-    direction_sign = 1 if direction_str == '多' else -1
+    direction_str  = 'long' if position['direction'] in ('long', '多') else 'short'
+
+    # P0-8 修正：当日盈亏必须基于今日收到的行情推送（None/陈旧缓存价都不算）
+    if received_today is not None and (
+            not received_today.get(sym, False) or _is_no_tick(tick)):
+        return {"pnl_today": None, "pnl_history": 0.0,
+                "price_basis": "no_tick", "cost_basis": "n/a"}
+
+    direction_sign = 1 if direction_str == 'long' else -1
     vol  = abs(position['volume'])  # FIX 2.4: 同 calc_greeks，防带符号 volume × direction_sign 双重取号
     size = contract.get('size', 1)
 
     # 已平仓：PnL全部为0，pnl_history 已是历史累计值
     if vol == 0:
-        return {"pnl_daily": 0.0, "pnl_today": 0.0, "pnl_history": 0.0}
+        return {"pnl_today": 0.0, "pnl_history": 0.0,
+                "price_basis": "closed", "cost_basis": "n/a"}
 
-    # 真实开仓成本（key 带方向后缀：IF2609_多 / IF2609_空）
-    cost_price = settlement_dict.get(f"{sym}_{direction_str}", position.get('price', 0.0))
-    # 新开仓（昨价为空）时用开仓价作基准，防止 pnl_today = 0
-    if cost_price == 0.0:
-        cost_price = position.get('price', 0.0)
+    pos_key = f"{sym}_{direction_str}"
+    ledger_open = (today_open_cost or {}).get(pos_key)  # 今日账本开仓加权价（可能为 None）
+
+    # 开仓成本（pnl_history 基准）：结算单开仓均价 → 今日账本开仓价 → CTP 持仓均价
+    # 结算单 key 带方向后缀（IC2612_long），裸名读不到 → 必须用 pos_key
+    cost_price = settlement_dict.get(pos_key, 0.0) or 0.0
+    cost_basis = "settlement_cost"
+    if cost_price <= 0:
+        if ledger_open and ledger_open > 0:
+            cost_price, cost_basis = ledger_open, "ledger_open_cost"
+        else:
+            cost_price = position.get('price', 0.0) or 0.0
+            cost_basis = "position_price"
 
     adj_price  = tick.get('adjust_price', tick.get('last_price', 0))
-    last_price = tick.get('last_price', 0)
 
     # 历史累计浮盈（开仓至今）
     pnl_history = direction_sign * (adj_price - cost_price) * vol * size
 
-    # 当日盯市盈亏（last_price 对比昨日结算价）
-    # settle_price 从昨日快照取 adjust_price（昨收价），无快照时用合约 pre_close 兜底
-    settle_price = None
+    # 当日盈亏基准链（基线 §3.7）：T-1 close_snapshot（Mark 均值）
+    #   → T-1 昨结算价 settlement_prices（裸 key，仅快照缺失/键不存在时）
+    #   → 今开仓成本（账本加权开仓价，昨结/昨收都没有 = 今开仓腿）
+    #   → None（不计入汇总）
+    # 禁止用同日盘中价凑基准；禁止跨业务日回退更老的快照
+    base_today, price_basis = None, "none"
+    has_prev_basis = False
     if yesterday_snapshot:
-        prev = yesterday_snapshot.get(f"{sym}_{direction_str}", {})
-        if prev:
-            settle_price = prev.get('adjust_price')
-    if settle_price is None:
-        settle_price = contract.get('pre_close', 0) or position.get('price', 0)
-    pnl_daily = direction_sign * (last_price - settle_price) * vol * size
-
-    # 当日盈亏 = adj_price 对比昨快照 adjust_price
-    # 降级链：昨快照 adjust_price → 今结算价 settlement_prices → NaN
-    base_today = None
-    if yesterday_snapshot:
-        prev = yesterday_snapshot.get(f"{sym}_{direction_str}", {})
-        if prev:
-            base_today = prev.get('adjust_price')
-    # 降级：取昨结算单的今结算价（full_*.json positions_detail.settlement_price）
+        prev = yesterday_snapshot.get(pos_key, {})
+        v = prev.get('adjust_price') if prev else None
+        if v and v > 0:
+            base_today, price_basis, has_prev_basis = v, "prev_close_snapshot", True
     if base_today is None and settlement_prices:
-        base_today = settlement_prices.get(sym)
-    if base_today is None:
-        import math
-        base_today = math.nan
-    if isinstance(base_today, float) and base_today != base_today:  # NaN check
-        pnl_today = math.nan
+        v = settlement_prices.get(sym)
+        if v and v > 0:
+            base_today, price_basis, has_prev_basis = v, "prev_settlement_fallback", True
+    # 今开仓腿：按开仓价计当日盈亏（与老系统盯市口径一致）
+    if base_today is None and ledger_open and ledger_open > 0:
+        base_today, price_basis = ledger_open, "today_open_cost"
+    elif has_prev_basis and ledger_open and ledger_open > 0:
+        # 昨仓 + 今开混合：单一基准无法拆分，昨仓基准覆盖全部手数 → 标注待核
+        price_basis = price_basis + "+today_open_mixed"
+
+    # 无基准 → pnl_today=None，不参与汇总，也不写 NaN 进快照
+    if base_today is None or base_today != base_today:
+        pnl_today = None
     else:
         pnl_today = direction_sign * (adj_price - base_today) * vol * size
 
     return {
-        "pnl_daily":   round(pnl_daily,   2),
-        "pnl_today":   round(pnl_today,   2),
+        "pnl_today":   round(pnl_today, 2) if pnl_today is not None else None,
         "pnl_history": round(pnl_history, 2),
+        "cost_price":  cost_price,
+        "price_basis": price_basis,
+        "cost_basis":  cost_basis,
     }
 
 
@@ -277,7 +320,9 @@ def calc_pnl(position: dict, contract: dict, tick: dict,
 def build_tree(positions: list, ticks: dict, contracts: dict,
                settlement_dict: dict,
                settlement_prices: dict = None,
-               yesterday_snapshot: dict = None) -> dict:
+               yesterday_snapshot: dict = None,
+               received_today: dict = None,
+               today_open_cost: dict = None) -> dict:
     """
     构建 L1→L2→L3 嵌套树。
     返回: { summary, tree }
@@ -302,7 +347,8 @@ def build_tree(positions: list, ticks: dict, contracts: dict,
             l3_nodes = []
             for pos in product_map[product][month]:
                 node = _build_l3_node(pos, ticks, contracts,
-                                      settlement_dict, settlement_prices, yesterday_snapshot)
+                                      settlement_dict, settlement_prices, yesterday_snapshot,
+                                      received_today, today_open_cost)
                 if node:
                     l3_nodes.append(node)
                     # L3 只进 L2，L1 汇总在 L2→L1 阶段做（避免 L1 双计）
@@ -344,7 +390,7 @@ def _make_metrics() -> dict:
         "volume": 0,
         "delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0,
         "deltacash": 0, "gammacash": 0, "vegacash": 0, "thetacash": 0,
-        "pnl_daily": 0.0, "pnl_today": 0.0, "pnl_history": 0.0,
+        "pnl_today": 0.0, "pnl_history": 0.0,
     }
 
 
@@ -352,8 +398,8 @@ def _make_summary() -> dict:
     return {
         "total_deltacash": 0, "total_gammacash": 0,
         "total_vegacash": 0,  "total_thetacash": 0,
-        "total_pnl_daily": 0.0, "total_pnl_today": 0.0,
-        "total_pnl_history": 0.0, "position_count": 0,
+        "total_pnl_today": 0.0, "total_pnl_history": 0.0, "position_count": 0,
+        "pnl_basis_counts": {},
     }
 
 
@@ -373,9 +419,22 @@ def _accumulate_metrics(metrics: dict, node: dict) -> None:
     metrics["gammacash"]   += m.get('gammacash', 0)
     metrics["vegacash"]    += m.get('vegacash', 0)
     metrics["thetacash"]   += m.get('thetacash', 0)
-    metrics["pnl_daily"]   += m.get('pnl_daily', 0)
-    metrics["pnl_today"]   += m.get('pnl_today', 0)
-    metrics["pnl_history"] += m.get('pnl_history', 0)
+    # F1 基准可见性：L3 叶子带 price_basis，逐级合并计数（仅告警/核对用，不参与数值）
+    _pb = m.get('price_basis')
+    if _pb:
+        _c = metrics.setdefault('pnl_basis_counts', {})
+        _c[_pb] = _c.get(_pb, 0) + 1
+    elif m.get('pnl_basis_counts'):
+        _c = metrics.setdefault('pnl_basis_counts', {})
+        for _k, _v in m['pnl_basis_counts'].items():
+            _c[_k] = _c.get(_k, 0) + _v
+    # NaN 安全：跳过 None/NaN 不累加，防止整链污染
+    _v = m.get('pnl_today', 0)
+    if _v is not None and _v == _v:  # NaN != NaN
+        metrics["pnl_today"] += _v
+    _v2 = m.get('pnl_history', 0)
+    if _v2 is not None and _v2 == _v2:
+        metrics["pnl_history"] += _v2
 
 
 def _accumulate_summary(total: dict, metrics: dict, l3_count: int = 1) -> None:
@@ -383,16 +442,27 @@ def _accumulate_summary(total: dict, metrics: dict, l3_count: int = 1) -> None:
     total["total_gammacash"]   += metrics.get("gammacash", 0)
     total["total_vegacash"]    += metrics.get("vegacash", 0)
     total["total_thetacash"]   += metrics.get("thetacash", 0)
-    total["total_pnl_daily"]   += metrics.get("pnl_daily", 0)
-    total["total_pnl_today"]   += metrics.get("pnl_today", 0)
-    total["total_pnl_history"] += metrics.get("pnl_history", 0)
+    # F1 基准计数并入 summary
+    if metrics.get("pnl_basis_counts"):
+        _c = total.setdefault("pnl_basis_counts", {})
+        for _k, _v in metrics["pnl_basis_counts"].items():
+            _c[_k] = _c.get(_k, 0) + _v
+    # NaN 安全
+    _tv = metrics.get("pnl_today", 0)
+    if _tv is not None and _tv == _tv:
+        total["total_pnl_today"] += _tv
+    _hv = metrics.get("pnl_history", 0)
+    if _hv is not None and _hv == _hv:
+        total["total_pnl_history"] += _hv
     total["position_count"]    += l3_count
 
 
 def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
                    settlement_dict: dict,
                    settlement_prices: dict = None,
-                   yesterday_snapshot: dict = None) -> dict | None:
+                   yesterday_snapshot: dict = None,
+                   received_today: dict = None,
+                   today_open_cost: dict = None) -> dict | None:
     sym      = pos['symbol'].split('.')[0]
     contract = contracts.get(sym, {})
     tick     = ticks.get(sym, {})
@@ -402,10 +472,11 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
     g    = calc_greeks(tick, pos, contract)
     tick_with_adj = dict(tick) if tick else {}
     tick_with_adj['adjust_price'] = adj_price
-    pnl = calc_pnl(pos, contract, tick_with_adj, settlement_dict, settlement_prices, yesterday_snapshot)
+    pnl = calc_pnl(pos, contract, tick_with_adj, settlement_dict, settlement_prices,
+                   yesterday_snapshot, received_today, today_open_cost)
 
     direction_raw = pos.get('direction', 'long')
-    direction_str = '多' if direction_raw in ('long', '多') else '空'
+    direction_str = 'long' if direction_raw in ('long', '多') else 'short'
 
     # ITM 判断
     itm = False
@@ -424,7 +495,7 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
         "volume":          pos.get('volume', 0),
         "last_price":      tick.get('last_price', 0),
         "adjust_price":    adj_price,
-        "open_price":      settlement_dict.get(sym, pos.get('price', 0)),
+        "open_price":      pnl.get('cost_price', settlement_dict.get(f"{sym}_{direction_str}", pos.get('price', 0))),
         "underlying_price":tick.get('underlying_price', 0),
         "iv":              tick.get('iv', None),
         "days_to_expiry":  contract.get('days_to_expiry', None),
@@ -437,9 +508,10 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
         "gammacash": g.get('gammacash', 0),
         "vegacash":  g.get('vegacash', 0),
         "thetacash": g.get('thetacash', 0),
-        "pnl_daily":   pnl.get('pnl_daily', 0),
-        "pnl_today":   pnl.get('pnl_today', 0),
+        "pnl_today":   pnl.get('pnl_today'),
         "pnl_history": pnl.get('pnl_history', 0),
+        "price_basis": pnl.get('price_basis', 'none'),
+        "cost_basis":  pnl.get('cost_basis', 'n/a'),
         "delta_tag": tag_delta(g.get('deltacash', 0)),
         "gamma_tag": tag_gamma(g.get('gammacash', 0)),
         "pnl_tag":   tag_pnl(pnl.get('pnl_history', 0)),

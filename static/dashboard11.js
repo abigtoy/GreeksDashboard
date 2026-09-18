@@ -26,10 +26,7 @@ const State = {
   serverUptime: 0,             // 服务端 uptime 秒（每次 /api/dashboard 刷新）
   uptimeAt:    0,              // 收到该 uptime 的本地时刻（补间用）
   snapshotMode: false,          // 离线快照模式：true 时停止轮询覆盖渲染
-  snapshotLabel: '',
 };
-
-// ─── 列定义 ──────────────────────────────────────────────────────────────────
 // ⚠️ 单一列源：表头(renderHead) / L1 / L2 / L3 行全部由此生成，改列只改这里。
 // 初始值由后端 _shared_state["column_config"] 提供，页面加载时从 API 同步
 let COL_DEF = [
@@ -49,7 +46,6 @@ let COL_DEF = [
   { col: 'vegacash',         label: 'VegaCash',  fmt: '0',     align: 'R' },
   { col: 'thetacash',        label: 'ΘCash',     fmt: '0',     align: 'R' },
   { col: 'days_to_expiry',   label: '剩余天',    fmt: '0',     align: 'R' },
-  { col: 'pnl_daily',        label: '盯日盈亏',  fmt: '0',     align: 'R' },
   { col: 'pnl_today',        label: '当日盈亏',  fmt: '0',     align: 'R' },
   { col: 'pnl_history',      label: '浮动盈亏',  fmt: '0',     align: 'R' },
 ];
@@ -62,7 +58,7 @@ async function loadColConfig() {
       const parsed = JSON.parse(local);
       // 验证完整性：至少14列以上才算有效配置
       if (Array.isArray(parsed) && parsed.length >= 14) {
-        COL_DEF = parsed;
+        COL_DEF = parsed.filter(c => c.col !== 'direction');   // 方向不显示，持仓量符号已含多空
         return;
       }
     } catch (_) {}
@@ -70,7 +66,7 @@ async function loadColConfig() {
   try {
     const r = await fetch_json('/api/columns');
     if (r && r.columns && Array.isArray(r.columns) && r.columns.length >= 14) {
-      COL_DEF = r.columns;
+      COL_DEF = r.columns.filter(c => c.col !== 'direction');
       localStorage.setItem('col_config', JSON.stringify(COL_DEF));
     }
   } catch (_) {}
@@ -465,7 +461,6 @@ function renderSummary(s) {
   set('sumGC',    s.total_gammacash,   0);
   set('sumVC',    s.total_vegacash,    0);
   set('sumTC',    s.total_thetacash,   0);
-  set('sumPnlD',  s.total_pnl_daily,   0);
   set('sumPnlT',  s.total_pnl_today,   0);
   set('sumPnlH',  s.total_pnl_history, 0);
   set('posCount', s.tree ? s.tree.reduce((n, l1) => n + l1.children.reduce((m, l2) => m + (l2.children || []).length, 0), 0) : 0, 0);
@@ -536,7 +531,7 @@ function buildL3Row(l3, l2Key) {
 
   const visible = COL_DEF.filter(c => c.visible !== false);
   // L3 合约名（symbol）显示在树控件格，带缩进
-  let html = `<td class="tree-cell"><span class="l3-sym">${l3.name || l3.symbol}</span></td>`;
+  let html = `<td class="tree-cell"><span class="l3-sym">${l3.symbol}</span></td>`;
 
   for (const c of visible) {
     if (c.col === 'symbol') {
@@ -545,17 +540,14 @@ function buildL3Row(l3, l2Key) {
     }
     let v = l3[c.col];
 
-    if (c.col === 'direction') {
-      v = l3.direction || '';
-    } else if (c.col === 'iv' && v !== null && v !== undefined) {
+    if (c.col === 'iv' && v !== null && v !== undefined) {
       v = parseFloat(v);
     }
 
     const numCls = isNumCol(c.col) ? 'num' : '';
     const tagCls = getTagClass(c.col, l3);
     const pnlC   = c.col === 'pnl_history' ? pnlCls(l3.pnl_history)
-                  : c.col === 'pnl_today'  ? pnlCls(l3.pnl_today)
-                  : c.col === 'pnl_daily'  ? pnlCls(l3.pnl_daily) : '';
+                  : c.col === 'pnl_today'  ? pnlCls(l3.pnl_today) : '';
     // 数字列默认右对齐；文本列默认左对齐
     const defAlign = isNumCol(c.col) ? 'right' : 'left';
     const align = c.align ? `text-align:${c.align==='R'?'right':'left'};` : `text-align:${defAlign};`;
@@ -576,14 +568,14 @@ function isNumCol(col) {
 function getCellClass(col, v, dc, gc, pnlH, deltaTag, gammaTag, pnlTag) {
   if (['deltacash','delta'].includes(col))    return cls(deltaTag);
   if (['gammacash','gamma'].includes(col))    return cls(gammaTag);
-  if (['pnl_history','pnl_today','pnl_daily'].includes(col)) return pnlCls(v);
+  if (['pnl_history','pnl_today'].includes(col)) return pnlCls(v);
   return '';
 }
 
 function getTagClass(col, l3) {
   if (['deltacash','delta'].includes(col))   return cls(l3.delta_tag);
   if (['gammacash','gamma'].includes(col))   return cls(l3.gamma_tag);
-  if (['pnl_history','pnl_today','pnl_daily'].includes(col)) return pnlCls(l3[col]);
+  if (['pnl_history','pnl_today'].includes(col)) return pnlCls(l3[col]);
   return '';
 }
 
@@ -668,6 +660,8 @@ function renderColConfigPanel() {
       <input type="checkbox" ${c.visible !== false ? 'checked' : ''}
         onchange="toggleColVisible(${i}, this.checked)">
       <span class="col-name">${c.label || c.col}</span>
+      <input type="text" value="${c.fmt || ''}" placeholder="格式"
+        onchange="setColFmt(${i}, this.value)">
       <button onclick="moveCol(${i}, -1)" ${i === 0 ? 'disabled' : ''}>←</button>
       <button onclick="moveCol(${i}, 1)" ${i === COL_DEF.length - 1 ? 'disabled' : ''}>→</button>
     </div>
@@ -697,7 +691,6 @@ function setColFmt(idx, fmt) {
   saveColConfig();
   renderHead();
   render();
-  renderColConfigPanel();
 }
 
 function doFilterByUnder(val) {
@@ -770,91 +763,30 @@ async function doReconnectFromModal() {
   await doConnect();
 }
 
-// ─── 切片弹窗 ─────────────────────────────────────────────────────────────────
-let _snapSelDate = '';
-let _snapSelSess = '';
-
-function openSnapModal() {
-  _snapSelDate = '';
-  _snapSelSess = '';
-  const modal = document.getElementById('snap-modal');
-  const dateIn = document.getElementById('snap-date');
-  const sessBtns = document.getElementById('snap-session-btns');
-  const msg = document.getElementById('snap-msg');
-  // 默认选今天
-  const today = new Date();
-  dateIn.value = today.toISOString().slice(0, 10);
-  _snapSelDate = dateIn.value;
-  sessBtns.style.display = 'none';
-  msg.textContent = '';
-  document.querySelectorAll('.snap-sess-btn').forEach(b => b.style.borderColor = '#2a3a4a');
-  modal.style.display = 'flex';
-  // 触发日期检查
-  onSnapDateChange();
+// ─── 切片下拉：后端列什么就选什么，按 name 直接加载 ──────────────────────────
+async function loadSnapOptions() {
+  if (State.snapshotMode) return;              // 看切片期间不重绘，避免选中项被清
+  const sel = document.getElementById('snap-select');
+  if (!sel) return;
+  const data = await fetch_json('/api/snapshots?t=' + Date.now());
+  sel.innerHTML = '<option value="">← 实时</option>' + (data || []).map(s => {
+    const tag = s.kind === 'close' ? '收盘' : (s.session || s.kind);
+    return `<option value="${s.name}">${s.trading_date} ${tag} ${s.leaves || s.position_count || 0}条</option>`;
+  }).join('');
 }
 
-function onSnapDateChange() {
-  const dateVal = document.getElementById('snap-date').value;
-  _snapSelDate = dateVal;
-  _snapSelSess = '';
-  const sessBtns = document.getElementById('snap-session-btns');
-  const msg = document.getElementById('snap-msg');
-  if (!dateVal) {
-    sessBtns.style.display = 'none';
-    msg.textContent = '请选择日期';
-    return;
-  }
-  // 查询该日期有哪些切片
-  fetch_json('/api/snapshots?t=' + Date.now()).then(data => {
-    // trading_date 格式是 YYYYMMDD，date input 值格式是 YYYY-MM-DD，统一转换
-    const dateYMD = dateVal.replace(/-/g, '');
-    const hasN = !!(data || []).find(s => s.trading_date === dateYMD && s.session === 'N');
-    const hasA = !!(data || []).find(s => s.trading_date === dateYMD && s.session === 'A');
-    const hasP = !!(data || []).find(s => s.trading_date === dateYMD && s.session === 'P');
-    sessBtns.style.display = 'flex';
-    document.querySelectorAll('.snap-sess-btn').forEach(b => {
-      const s = b.dataset.sess;
-      const exists = (s === 'N' && hasN) || (s === 'A' && hasA) || (s === 'P' && hasP);
-      b.style.opacity = exists ? '1' : '0.3';
-      b.style.cursor = exists ? 'pointer' : 'not-allowed';
-      b.style.borderColor = '#2a3a4a';
-    });
-    if (!hasN && !hasA && !hasP) {
-      msg.textContent = '该日期无切片数据';
-    } else {
-      msg.textContent = '';
-    }
-  });
-}
-
-function selectSnapSess(sess) {
-  const btn = document.querySelector(`.snap-sess-btn[data-sess="${sess}"]`);
-  if (!btn || btn.style.cursor === 'not-allowed') return;
-  _snapSelSess = sess;
-  document.querySelectorAll('.snap-sess-btn').forEach(b => b.style.borderColor = '#2a3a4a');
-  btn.style.borderColor = '#4a9eff';
-  document.getElementById('snap-msg').textContent = '';
-}
-
-async function confirmSnapLoad() {
-  if (!_snapSelDate || !_snapSelSess) {
-    document.getElementById('snap-msg').textContent = '请先选择日期和场次';
-    return;
-  }
-  const name = `data_snapshot_${_snapSelDate.replace(/-/g, '')}_${_snapSelSess}.json`;
+async function onSnapSelect(name) {
+  if (!name) { returnToLive(); return; }
   const data = await fetch_json('/api/snapshot/load', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
   });
   if (!data || data.status !== 'ok') {
-    document.getElementById('snap-msg').textContent = '加载失败';
+    document.getElementById('snap-select').value = '';   // fetch_json 已 showMsg 报错
     return;
   }
   State.snapshotMode = true;
-  document.getElementById('btn-return-live').style.display = '';
-  document.getElementById('btn-snapshot').style.display = 'none';
-  State.snapshotLabel = `${_snapSelSess === 'N' ? '夜盘' : _snapSelSess === 'A' ? '早盘' : '午盘'} ${_snapSelDate}`;
   State.snapshot = {
     status: 'snapshot',
     tree: data.tree || [],
@@ -867,20 +799,14 @@ async function confirmSnapLoad() {
     State.expandedG.add(l1.key);
     (l1.children || []).forEach(l2 => State.expandedM.add(l2.key));
   });
-  closeSnapModal();
   render();
   renderSummary(data.summary || {});
 }
 
-function closeSnapModal() {
-  document.getElementById('snap-modal').style.display = 'none';
-}
-
 function returnToLive() {
   State.snapshotMode = false;
-  document.getElementById('btn-return-live').style.display = 'none';
-  document.getElementById('btn-snapshot').style.display = '';
   fetchDashboard();
+  loadSnapOptions();
 }
 
 // ─── 初始化 ──────────────────────────────────────────────────────────────────
@@ -928,6 +854,10 @@ async function init() {
   // 看板轮询
   fetchDashboard();
   setInterval(fetchDashboard, POLL_MS);
+
+  // 切片下拉（列表一天只变一次，60s 刷够用；避免每 3s 重读 20 份 JSON）
+  loadSnapOptions();
+  setInterval(loadSnapOptions, 60000);
 
   // uptime 时钟
   setInterval(updateHeader, 1000);

@@ -1,16 +1,26 @@
 """
 run_server.py — 启动入口
 引用 dashboard_v2.api_server.create_app()
+
+单实例管理：
+- Mutex 互斥（按账户名隔离）
+- instance.json 持久化实例信息
+- 健康检查区分"已有实例"vs"疑似残留"
+- 禁止重复启动，不自动杀进程
 """
 
 import os
 import sys
-import socket
 import json
-import subprocess
-import time
+import socket
 import ctypes
 import ctypes.wintypes as wintypes
+BOOL = ctypes.c_long
+HANDLE = ctypes.c_void_p
+DWORD = ctypes.c_ulong
+import time
+import urllib.request
+import urllib.error
 
 # 项目根目录
 _project_root = os.path.dirname(os.path.abspath(__file__))
@@ -18,109 +28,195 @@ sys.path.insert(0, _project_root)
 
 from dashboard_v2.api_server import create_app
 
-# 结算单目录（相对于项目根目录）
+# 结算单目录
 SETTLEMENT_DIR = os.path.join(_project_root, "结算单")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 单实例互斥锁（Windows Mutex，跨进程有效）
+# Windows Mutex（跨进程有效）
 # ─────────────────────────────────────────────────────────────────────────────
 
 _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-_CREATEMUTEXW = _KERNEL32.CreateMutexW
-_CREATEMUTEXW.argtypes = [ctypes.c_void_p, wintypes.BOOL, ctypes.c_wchar_p]
-_CREATEMUTEXW.restype = wintypes.HANDLE
-
-_WAITFORSINGLEOBJECT = _KERNEL32.WaitForSingleObject
-_WAITFORSINGLEOBJECT.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-_WAITFORSINGLEOBJECT.restype = wintypes.DWORD
-
-_RELEASE_MUTEX = _KERNEL32.ReleaseMutex
-_RELEASE_MUTEX.argtypes = [wintypes.HANDLE]
-_RELEASE_MUTEX.restype = wintypes.BOOL
-
-_CLOSE_HANDLE = _KERNEL32.CloseHandle
-_CLOSE_HANDLE.argtype = [wintypes.HANDLE]
-_CLOSE_HANDLE.restype = wintypes.BOOL
+_CreateMutexW = _KERNEL32.CreateMutexW
+_CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, ctypes.c_wchar_p]
+_CreateMutexW.restype = wintypes.HANDLE
+_WaitForSingleObject = _KERNEL32.WaitForSingleObject
+_WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_WaitForSingleObject.restype = wintypes.DWORD
+_ReleaseMutex = _KERNEL32.ReleaseMutex
+_ReleaseMutex.argtypes = [wintypes.HANDLE]
+_ReleaseMutex.restype = wintypes.BOOL
+_CloseHandle = _KERNEL32.CloseHandle
+_CloseHandle.argtypes = [wintypes.HANDLE]
+_CloseHandle.restype = wintypes.BOOL
+_GetLastError = _KERNEL32.GetLastError
+_GetLastError.restype = wintypes.DWORD
 
 _ERROR_ALREADY_EXISTS = 183
+_WAIT_TIMEOUT = 0x102
 
-_mtx: wintypes.HANDLE | None = None
+# ─────────────────────────────────────────────────────────────────────────────
+# instance.json 管理
+# ─────────────────────────────────────────────────────────────────────────────
 
+_INSTANCE_FILE = os.path.join(_project_root, "instance.json")
 
-def _acquire_lock() -> bool:
+def _load_instance() -> dict | None:
+    """读取已有 instance.json，不存在返回 None"""
+    if not os.path.exists(_INSTANCE_FILE):
+        return None
+    try:
+        return json.loads(open(_INSTANCE_FILE, encoding="utf-8").read())
+    except Exception:
+        return None
+
+def _save_instance(info: dict):
+    """原子写入 instance.json"""
+    tmp = _INSTANCE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _INSTANCE_FILE)
+
+def _delete_instance():
+    """删除 instance.json（忽略不存在）"""
+    try:
+        if os.path.exists(_INSTANCE_FILE):
+            os.remove(_INSTANCE_FILE)
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 健康检查
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _health_check(port: int, timeout: float = 2.0) -> dict | None:
+    """curl http://127.0.0.1:{port}/api/health，成功返回 JSON，失败返回 None"""
+    url = f"http://127.0.0.1:{port}/api/health"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        pass
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 获取账户名（用于 Mutex key 和 instance.json）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_account_name() -> str:
+    """从 ctp_accounts.json 读取当前激活账户名"""
+    accounts_file = os.path.join(_project_root, "ctp_accounts.json")
+    try:
+        data = json.loads(open(accounts_file, encoding="utf-8").read())
+        return data.get("active", "default")
+    except Exception:
+        return "default"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 主逻辑
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_mutex_name(account: str) -> str:
+    return f"Local\\GreeksDashboard_{account}"
+
+def _try_start(port: int, account: str):
     """
-    尝试获取 Windows Mutex 单实例锁。
-    返回 True 表示获得锁（可以启动），False 表示已有实例在运行。
+    尝试启动服务。
+    - 成功：获得 Mutex，写入 instance.json，启动 Flask
+    - 失败（已有实例）：打印已有实例信息，退出
     """
-    global _mtx
-    _mtx = _CREATEMUTEXW(None, False, "GreeksDashboard_SingleInstance_Mutex")
-    # 如果 mutex 已存在（另一个进程持有），CreateMutexW 仍返回有效句柄，
-    # 但 GetLastError() == ERROR_ALREADY_EXISTS；尝试等待0秒看能否获得所有权
-    owned = (_WAITFORSINGLEOBJECT(_mtx, 0) == 0)  # 0 = WAIT_OBJECT_0，获得锁
+    mtx_name = _build_mutex_name(account)
+    mtx = _CreateMutexW(None, False, mtx_name)
+    owned = (_WaitForSingleObject(mtx, 0) == 0)  # 0 = WAIT_OBJECT_0
+
     if not owned:
-        _CLOSE_HANDLE(_mtx)
-        _mtx = None
-        return False
-    return True
+        # Mutex 被占用，尝试健康检查
+        _CloseHandle(mtx)
+        existing = _health_check(port)
+        if existing and existing.get("status") == "running":
+            # 已有健康实例，拒绝启动
+            inst = existing.get("instance", {})
+            print("[拒绝] 服务已在运行，禁止重复启动。")
+            print(f"  实例 PID:    {existing.get('pid', 'unknown')}")
+            print(f"  账户:        {inst.get('account', 'unknown')}")
+            print(f"  启动时间:    {inst.get('started_at', 'unknown')}")
+            print(f"  CTP 状态:    {existing.get('ctp_status', 'unknown')}")
+            print(f"  健康检查:    http://127.0.0.1:{port}/api/health")
+            print()
+            print("请先停止当前实例，再启动新实例。")
+            print(f"停止命令: curl -X POST http://127.0.0.1:{port}/api/shutdown")
+            sys.exit(1)
+        else:
+            # 疑似残留实例（健康检查失败）
+            inst = _load_instance() or {}
+            print("[警告] 疑似残留实例（Mute x存在但健康检查失败）。")
+            print(f"  记录的 PID:  {inst.get('pid', 'unknown')}")
+            print(f"  账户:        {inst.get('account', 'unknown')}")
+            print(f"  启动时间:    {inst.get('started_at', 'unknown')}")
+            print()
+            print("请手动停止残留进程后再启动：")
+            if inst.get("pid"):
+                print(f"  taskkill /PID {inst['pid']}")
+            sys.exit(1)
 
+    # 获得 Mutex，启动服务
+    import atexit
 
-def _release_lock():
-    """退出时释放 Mutex"""
-    global _mtx
-    if _mtx:
-        _RELEASE_MUTEX(_mtx)
-        _CLOSE_HANDLE(_mtx)
-        _mtx = None
+    def _cleanup():
+        _ReleaseMutex(mtx)
+        _CloseHandle(mtx)
+        _delete_instance()
 
+    atexit.register(_cleanup)
 
-if __name__ == "__main__":
-    import atexit as _atexit
-    from pathlib import Path as _Path
+    # 写入 instance.json
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    instance_info = {
+        "instance_id": f"{account}_{int(time.time())}",
+        "account": account,
+        "pid": os.getpid(),
+        "started_at": started_at,
+        "port": port,
+        "status": "running",
+    }
+    _save_instance(instance_info)
 
-    # ── 看门狗 marker：记录当前 server PID ───────────────────────────
-    _WATCHDOG_MARKER = _Path(_project_root) / "watchdog_marker.json"
+    print(f"[启动] 账户: {account}")
+    print(f"[启动] PID:  {os.getpid()}")
+    print(f"[启动] 时间: {started_at}")
+    print(f"[启动] 端口: {port}")
+    print(f"[启动] 实例文件: {_INSTANCE_FILE}")
+    print()
 
-    def _write_server_pid():
-        try:
-            m = {}
-            if _WATCHDOG_MARKER.exists():
-                m = json.loads(_WATCHDOG_MARKER.read_text(encoding="utf-8"))
-            m["server_pid"] = os.getpid()
-            _WATCHDOG_MARKER.write_text(json.dumps(m, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-
-    def _clear_server_pid():
-        try:
-            if _WATCHDOG_MARKER.exists():
-                m = json.loads(_WATCHDOG_MARKER.read_text(encoding="utf-8"))
-                m.pop("server_pid", None)
-                _WATCHDOG_MARKER.write_text(json.dumps(m, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-
-    # ── 单实例检查（Mutex，跨进程生效）───────────────────────────────
-    if not _acquire_lock():
-        print("[拒绝] 服务已在运行，禁止重复启动。")
-        sys.exit(1)
-    _atexit.register(_release_lock)
-    _atexit.register(_clear_server_pid)
-    _write_server_pid()
-
-    # ── 端口检查（检查是否有其他进程占着 5000）───────────────────────
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    occupied = sock.connect_ex(("127.0.0.1", 5000)) == 0
-    sock.close()
-    if occupied:
-        print("[启动] 5000 端口被占用，可能是残留连接，继续启动...")
-
+    # 创建 Flask
     app = create_app(
         settlement_dir=SETTLEMENT_DIR,
         static_folder=os.path.join(_project_root, "static"),
         template_folder=os.path.join(_project_root, "templates"),
+        instance_info=instance_info,
     )
-    print(f"启动服务 http://0.0.0.0:5000")
-    print(f"结算单目录: {SETTLEMENT_DIR}")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+
+    # 写 watchdog marker（兼容旧 watchdog）
+    _WATCHDOG = os.path.join(_project_root, "watchdog_marker.json")
+    try:
+        wd = json.loads(open(_WATCHDOG).read()) if os.path.exists(_WATCHDOG) else {}
+    except Exception:
+        wd = {}
+    wd["server_pid"] = os.getpid()
+    open(_WATCHDOG, "w", encoding="utf-8").write(json.dumps(wd, ensure_ascii=False))
+    atexit.register(lambda: (wd.pop("server_pid", None),
+                              open(_WATCHDOG, "w", encoding="utf-8").write(json.dumps(wd, ensure_ascii=False)))
+                              if os.path.exists(_WATCHDOG) else None)
+
+    print(f"[启动] 服务 http://0.0.0.0:{port}")
+    print(f"[启动] 结算单目录: {SETTLEMENT_DIR}")
+    print(f"[启动] 健康检查: http://127.0.0.1:{port}/api/health")
+    print()
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    PORT = 5000
+    account = _get_account_name()
+    _try_start(PORT, account)

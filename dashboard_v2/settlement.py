@@ -24,15 +24,15 @@ _SHORT_DIRS = {'卖', '空', 'S', '-1', 'Sell', 'S', 'Short', 'short'}
 
 def _parse_direction(raw: str) -> str | None:
     """
-    方向解析。返回 '多'、'空' 或 None（未知方向，拒绝入账）。
+    方向解析。返回 'long'、'short' 或 None（未知方向，拒绝入账）。
     """
     if not raw:
         return None
     s = str(raw).strip()
     if s in _LONG_DIRS:
-        return '多'
+        return 'long'
     if s in _SHORT_DIRS:
-        return '空'
+        return 'short'
     return None
 
 # -----------------------------------------------------------------------
@@ -54,14 +54,18 @@ def _net_aggregate(details: list, price_field: str) -> dict[str, float]:
         sym = item.get('instrument', '')
         if not sym:
             continue
-        # 方向来源：优先用 direction 字段（positions_summary 场景），降级用 bs 字段（positions_detail 场景）
+        # 方向来源：优先用 direction 字段（Dashboard schema），降级用 bs 字段（vnpy schema）
         raw_dir = item.get('direction', '') or item.get('bs', '')
-        price = float(item.get(price_field) or 0)
+        direction = _parse_direction(str(raw_dir))
+        if direction is None:
+            continue                      # 未知方向拒绝入账
+        # 结算价字段两名并存：settl_price（vnpy schema）/ settlement_price（Dashboard schema）
+        price = float(item.get(price_field) or item.get('settlement_price') or 0)
         vol = int(item.get('volume') or item.get('position') or 0)
         if price <= 0 or vol <= 0:
             continue
         a = agg[sym]
-        if raw_dir in ('多', '买', 'long', 'buy'):
+        if direction == 'long':
             a["long_cost"] += price * vol
             a["long_vol"] += vol
         else:
@@ -102,36 +106,15 @@ def load_settlement_cost(settlement_json: dict) -> dict:
     settlement_dict: dict[str, float] = {}
     detail_calc: dict[str, dict[str, float]] = defaultdict(lambda: {"total_cost": 0.0, "total_vol": 0})
 
-    # ========== 策略1: positions_summary 多空均价（无方向歧义）==========
-    summary_list = settlement_json.get('positions_summary') or []
-    for item in summary_list:
-        sym = (item.get('instrument') or '').strip()
-        if not sym:
-            continue
-
-        # 多仓
-        long_pos  = int(item.get('long_pos', 0) or 0)
-        avg_buy   = float(item.get('avg_buy', 0.0) or 0.0)
-        if long_pos > 0 and avg_buy > 0:
-            key = f"{sym}_多"
-            settlement_dict[key] = round(avg_buy, 4)
-
-        # 空仓
-        short_pos = int(item.get('short_pos', 0) or 0)
-        avg_sell  = float(item.get('avg_sell', 0.0) or 0.0)
-        if short_pos > 0 and avg_sell > 0:
-            key = f"{sym}_空"
-            settlement_dict[key] = round(avg_sell, 4)
-
-    # ========== 策略2: positions_detail 逐笔明细 VWAP 自算（兜底 + 差异告警）==========
+    # positions_detail 逐笔明细 VWAP 自算（唯一路径）
     details = settlement_json.get('positions_detail') or []
     for item in details:
         sym = (item.get('instrument') or '').strip()
         if not sym:
             continue
 
-        # 方向从 bs 字段取（买/卖）
-        raw_dir = str(item.get('bs') or '')
+        # 方向：优先 direction（Dashboard schema 多/空），降级 bs（vnpy schema 买/卖）
+        raw_dir = str(item.get('direction') or item.get('bs') or '')
         direction = _parse_direction(raw_dir)
         if direction is None:
             logger.warning(f"[结算单] 未知方向拒绝入账: bs={raw_dir!r}, sym={sym}")
@@ -143,20 +126,10 @@ def load_settlement_cost(settlement_json: dict) -> dict:
             continue
 
         key = f"{sym}_{direction}"
-        if key in settlement_dict:
-            # 差异告警
-            delta = abs(open_price - settlement_dict[key]) / max(settlement_dict[key], 1e-9)
-            if delta > 0.05:
-                logger.warning(
-                    f"[结算单] 汇总/明细差异 >5%: {sym} {direction} "
-                    f"汇总={settlement_dict[key]:.4f} 明细={open_price:.4f} 差异={delta*100:.1f}%"
-                )
-        else:
-            # 策略2 兜底（明细优先）
-            detail_calc[key]["total_cost"] += open_price * position
-            detail_calc[key]["total_vol"]  += position
+        detail_calc[key]["total_cost"] += open_price * position
+        detail_calc[key]["total_vol"]  += position
 
-    # 策略2 自算 VWAP 回填（兜底 keys）
+    # VWAP 回填
     for key, data in detail_calc.items():
         if data["total_vol"] > 0:
             settlement_dict[key] = round(data["total_cost"] / data["total_vol"], 4)
@@ -170,7 +143,7 @@ def load_settlement_cost(settlement_json: dict) -> dict:
 def load_settlement_prices(settlement_json: dict) -> dict:
     """
     净仓聚合今结算价（Settlement Price）。
-    今结算价 = pnl_today 基准价（降级链：昨快照 adjust_price → 今结算价 → NaN）。
+    今结算价 = pnl_today 基准价（降级链：昨快照 adjust_price → 今结算价 → None 不计入）。
     返回: { "IC2612": 7347.4, "IC2609": 7565.0, ... }
     """
     details = settlement_json.get('positions_detail') or []
@@ -207,9 +180,10 @@ def load_settlement_sync(dir_path: str) -> dict:
 # =======================================================================
 # SettlementManager — 状态管理器（增量同步 + 日期标记）
 # =======================================================================
+# 统一到项目内 结算单/（与 vnpy_ctp 网关硬编码写入路径一致）
 SETTLEMENT_DIR   = os.path.abspath(
     os.path.join(os.path.realpath(os.path.dirname(os.path.dirname(__file__))),
-                 "..", "vnpy接口封装", "结算单"))
+                 "结算单"))
 META_FILE        = os.path.join(SETTLEMENT_DIR, "settlement_meta.json")
 LOOKBACK_DAYS    = 30          # 每次补缺漏扫描近 N 天
 
@@ -266,6 +240,29 @@ def _scanned_dates() -> set[str]:
         if bn.startswith("full_") and bn.endswith(".json"):
             dates.add(bn[5:-5])            # e.g. 20260910
     return dates
+
+
+def _is_valid_settlement(path: str) -> bool:
+    """
+    Schema 校验：必须是"真结算单"——含 positions_detail，且行带 instrument + 结算价字段。
+    用于排除实时持仓 dump 冒充的 full_*.json（如 20260916：只有 positions/positions_summary）。
+    """
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    rows = data.get('positions_detail') or []
+    if not rows:
+        return False
+    r0 = rows[0]
+    return bool(r0.get('instrument')) and ('settl_price' in r0 or 'settlement_price' in r0)
+
+
+def _valid_dates() -> set[str]:
+    """schema 有效的结算单日期（meta.latest / 基准价选择只用这些；不改名不删文件）。"""
+    return {d for d in _scanned_dates()
+            if _is_valid_settlement(os.path.join(SETTLEMENT_DIR, f"full_{d}.json"))}
 
 
 def _missing_dates() -> list[str]:
@@ -366,18 +363,17 @@ class SettlementManager:
         启动时调用（CTP 断线重连后不重新下载，直接用已入库数据）。
         若 meta.latest 不存在（首次运行/ meta 文件丢失），自动扫描最新 full_*.json 兜底。
         """
+        # 网关解析线程会更新磁盘 meta（如 20:00 后新结算单入库）→ 每轮重读，否则常驻进程永远停在旧日期
+        self._meta = _read_meta()
         latest = self._meta.get("latest")
-        if not latest:
-            # 兜底：扫描最新入库结算单
-            import glob
-            files = sorted(glob.glob(os.path.join(SETTLEMENT_DIR, "full_*.json")))
-            if files:
-                latest_path = files[-1]
-                latest = os.path.splitext(os.path.basename(latest_path))[0].replace("full_", "")
-                self._meta["latest"] = latest
-                logger.info(f"[SettlementManager] meta.latest 为空，已自动推断: {latest}")
-            else:
+        valid = _valid_dates()
+        # meta.latest 缺失 / 指向 schema 无效文件（如实时持仓 dump）→ 退回最近有效结算单
+        if not latest or latest not in valid:
+            if not valid:
                 return
+            logger.info(f"[SettlementManager] meta.latest={latest!r} 无效，改用 {max(valid)}")
+            latest = max(valid)
+            self._meta["latest"] = latest
         path = os.path.join(SETTLEMENT_DIR, f"full_{latest}.json")
         if not os.path.exists(path):
             return
@@ -694,8 +690,8 @@ class SettlementManager:
         return True, ""
 
     def _refresh_meta(self):
-        """扫描 full_*.json，更新 meta.latest 为有效结算单日期。"""
-        dates = _scanned_dates()
+        """扫描 full_*.json，更新 meta.latest 为 schema 有效的最近结算单日期。"""
+        dates = _valid_dates()
         if not dates:
             self._meta = {"latest": None, "loaded": False}
             _write_meta(self._meta)

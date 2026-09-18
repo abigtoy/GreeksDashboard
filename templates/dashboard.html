@@ -211,8 +211,10 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   </div>
   <button type="button" class="btn btn-ctp" id="btn-ctp" onclick="onCtpBtnClick()">● 连接CTP</button>
   <button type="button" class="btn btn-toggle" id="btn-settings">⚙ 看板设置</button>
-  <button type="button" class="btn btn-toggle" id="btn-snapshot" onclick="openSnapModal()">📁 切片</button>
-  <button type="button" class="btn btn-toggle" id="btn-return-live" onclick="returnToLive()" style="display:none">← 返回实时</button>
+  <div class="hdr-account">
+    <label>切片</label>
+    <select id="snap-select" onchange="onSnapSelect(this.value)"><option value="">← 实时</option></select>
+  </div>
 </div>
 
 <div id="settings-panel">
@@ -251,7 +253,6 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   <div class="summary-item"><div class="label">ΓCash</div><div class="value gamma" id="sumGC">-</div></div>
   <div class="summary-item"><div class="label">VegaCash</div><div class="value vega" id="sumVC">-</div></div>
   <div class="summary-item"><div class="label">ΘCash</div><div class="value theta" id="sumTC">-</div></div>
-  <div class="summary-item"><div class="label">盯日盈亏</div><div class="value pnl" id="sumPnlD">-</div></div>
   <div class="summary-item"><div class="label">当日盈亏</div><div class="value pnl" id="sumPnlT">-</div></div>
   <div class="summary-item"><div class="label">浮动盈亏</div><div class="value pnl" id="sumPnlH">-</div></div>
   <div class="summary-item"><div class="label">持仓数</div><div class="value" id="posCount">-</div></div>
@@ -282,25 +283,6 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   </div>
 </div>
 
-<div id="snap-modal" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.75); z-index:9999; align-items:center; justify-content:center;">
-  <div style="background:#1a2332; border:1px solid #2a3a4a; border-radius:8px; padding:28px 36px; min-width:360px; text-align:center;">
-    <div style="color:#4a9eff; font-size:16px; font-weight:600; margin-bottom:20px;">📁 加载切片数据</div>
-    <div style="margin-bottom:16px;">
-      <input type="date" id="snap-date" onchange="onSnapDateChange()" style="background:#0f1419; border:1px solid #2a3a4a; color:#e8e8e8; padding:8px 12px; font-size:13px; border-radius:4px; outline:none; width:200px;">
-    </div>
-    <div id="snap-session-btns" style="display:none; gap:10px; justify-content:center; margin-bottom:20px;">
-      <button class="snap-sess-btn" data-sess="N" onclick="selectSnapSess('N')" style="background:#141d28; border:1px solid #2a3a4a; color:#e8e8e8; padding:8px 18px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600;">夜盘 N</button>
-      <button class="snap-sess-btn" data-sess="A" onclick="selectSnapSess('A')" style="background:#141d28; border:1px solid #2a3a4a; color:#e8e8e8; padding:8px 18px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600;">早盘 A</button>
-      <button class="snap-sess-btn" data-sess="P" onclick="selectSnapSess('P')" style="background:#141d28; border:1px solid #2a3a4a; color:#e8e8e8; padding:8px 18px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600;">午盘 P</button>
-    </div>
-    <div id="snap-msg" style="color:#8ba3b8; font-size:12px; margin-bottom:16px; min-height:18px;"></div>
-    <div style="display:flex; gap:10px; justify-content:center;">
-      <button onclick="confirmSnapLoad()" style="background:#16a34a; color:#fff; border:none; padding:8px 20px; border-radius:4px; cursor:pointer; font-size:13px; font-weight:600;">确认</button>
-      <button onclick="closeSnapModal()" style="background:#2a3a4a; color:#8ba3b8; border:none; padding:8px 20px; border-radius:4px; cursor:pointer; font-size:13px;">取消</button>
-    </div>
-  </div>
-</div>
-
-<script src="/static/dashboard11.js?v=12"></script>
+<script src="/static/dashboard11.js?v=14"></script>
 </body>
 </html>
