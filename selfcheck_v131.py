@@ -227,6 +227,16 @@ try:
     reset_cache()
     check("当日 close_snapshot 不作基准", A._load_yesterday_snapshot() == {})
 
+    # 4f-2 回归（2026-09-18 夜盘事故）：结算单日历滞后一天（只到 0916），
+    #      但 0918 收盘快照已落盘 → 快照即实据，必须作基准，不得降级结算价
+    A._valid_dates = lambda: {"20260916"}
+    reset_cache(); at(210000)                     # 夜盘：bd = 20260919
+    r = A._load_yesterday_snapshot()
+    check("结算单日历滞后 → 快照仍作基准（快照为主、结算单为备）",
+          r.get("IF2609_long", {}).get("adjust_price") == 3500.0, str(r))
+    A._valid_dates = lambda: {"20260917", "20260918"}
+    at(100000)                                    # 还原时钟到日盘，不污染 4g
+
     # 4g 交易日历不可用时退化（带 WARNING）+ 同业务日缓存命中
     def _boom():
         raise RuntimeError("结算单目录不可读")

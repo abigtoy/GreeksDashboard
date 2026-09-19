@@ -318,9 +318,11 @@ class SettlementManager:
             else:
                 results["errors"].append(f"{d}: {err}")
 
-        # Step 2: 下载当天（如 20:00 后）
+        # Step 2: 下载当天（如 20:20 后）
+        # 20:20 起 CTP 当日结算单可查；口径：有 full_{date}.json 就是已下载，不另设标记
         today_str = _cutoff_date()
-        if datetime.now().hour >= 20:
+        _now = datetime.now()
+        if _now.hour * 60 + _now.minute >= 20 * 60 + 20:
             # 检查当天是否已入库（防止重复下载）
             if today_str not in _scanned_dates():
                 ok, err = self._download_and_parse(today_str)

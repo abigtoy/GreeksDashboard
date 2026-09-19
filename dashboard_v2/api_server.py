@@ -1224,21 +1224,26 @@ def _leaf_marks(tree_nodes) -> dict:
 
 def _prev_trading_day_file(bd: str):
     """T-1 业务日的收盘快照文件名；无则 None（不跨业务日回退，基准降级结算价）。
-    T-1 以结算单有效日期为准（`_valid_dates()` 是系统内唯一有实据的交易日历，
-    与结算价降级同一参照系）；结算单不可用时退化为目录里 < 今日 的最大日期并 WARNING。"""
+
+    基准优先级（基线 §3.7）：**收盘快照是基准，结算单是降级备用**。
+    快照日期本身即「该交易日已收盘」的实据，不靠结算单背书 → 默认直接命中最近一份 < bd 的快照。
+    结算单日历只保留一个守卫职能：确认「T-1 是交易日、当日却无快照」（如服务停机）
+    → 返回 None 由 calc_pnl 降级结算价，绝不用更老的快照冒充昨收。
+    """
     older = {d: n for d, n in _close_dates().items() if d < bd}
     if not older:
-        return None
+        return None                       # 一份快照都没有 → 降级结算价
+    latest = max(older)
     try:
-        ref = max((d for d in _valid_dates() if d < bd), default="")
+        cal = max((d for d in _valid_dates() if d < bd), default="")
     except Exception as e:
         logger.warning(f"[close_snapshot] 读结算单交易日历失败: {e}")
-        ref = ""
-    if ref:
-        return older.get(ref)     # T-1 无快照 → None，由 calc_pnl 降级昨结算价
-    d = max(older)
-    logger.warning(f"[close_snapshot] 结算单交易日历不可用，T-1 退化为最近快照 {d}")
-    return older[d]
+        return older[latest]              # 日历不可用 → 快照照用（快照即实据）
+    if cal and cal > latest:
+        logger.warning(f"[close_snapshot] 结算单日历 T-1=%s 是交易日但无当日快照（服务停机？）"
+                       "→ 基准降级结算价，不用更老的 %s" % (cal, latest))
+        return None
+    return older[latest]
 
 
 def _load_yesterday_snapshot() -> dict:
