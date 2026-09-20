@@ -643,13 +643,130 @@ function _toggle_settings() {
 
 function switchSettingsTab(tab) {
   document.querySelectorAll('.settings-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-content, .col-config-panel').forEach(t => { t.style.display = 'none'; });
-  const tabEl = document.querySelector('.settings-tab[onclick="switchSettingsTab(\'' + tab + '\')"]');
+  document.querySelectorAll('.tab-content, .col-config-panel, .settings-tab-content').forEach(t => { t.style.display = 'none'; });
+  // 使用 data-tab 匹配避免转义问题
+  const tabEl = [...document.querySelectorAll('.settings-tab')].find(t => {
+    const txt = t.onclick?.toString() || '';
+    return txt.includes("switchSettingsTab('" + tab + "')");
+  });
   if (tabEl) tabEl.classList.add('active');
   const contentEl = document.getElementById('tab-' + tab);
   if (contentEl) contentEl.style.display = 'block';
   if (tab === 'cols') renderColConfigPanel();
+  if (tab === 'risk') loadRiskThresholds();
+  if (tab === 'sigma') loadSigmaRef();
 }
+
+// ─── 风控阈值面板 ─────────────────────────────────────────────────────────────
+async function loadRiskThresholds() {
+  const el = document.getElementById('risk-thresholds');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/alert/settings');
+    const data = await res.json();
+    const cfg = data.settings || {};
+    const spec = data.spec || {};
+    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;">';
+    for (const k of Object.keys(spec)) {
+      const label = spec[k].label || k;
+      const val = cfg[k] ?? null;
+      const lo = spec[k].lo, hi = spec[k].hi, step = spec[k].step || 0.01;
+      const isNum = typeof val === 'number';
+      const unit = (k.includes('rate') || k.includes('burn')) ? '' : (k.includes('delta') ? '手' : '');
+      html += `<div class="field"><label>${label}</label><input type="${unit==='手'?'number':'text'}" id="th-${k}" value="${isNum?val:''}" placeholder="${Math.round((lo+hi)/2)}" ${unit?'min="'+lo+'" max="'+hi+'" step="'+step+'"':''}> <small>${unit||''}</small></div>`;
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  } catch(e) { console.error(e); }
+}
+
+async function saveRiskThresholds() {
+  const patch = {};
+  const keys = ['f_rate_warn','f_rate_danger','iv_rate_warn','net_delta_warn','burn_warn','burn_danger','margin_ratio_warn','margin_ratio_danger'];
+  for (const k of keys) {
+    const inp = document.getElementById('th-'+k);
+    if (inp && inp.value) {
+      const v = parseFloat(inp.value);
+      if (!isNaN(v)) patch[k] = v;
+    }
+  }
+  try {
+    const res = await fetch('/api/alert/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(patch)});
+    const ok = await res.json();
+    alert(ok.ok ? '已保存' : ('保存失败:'+JSON.stringify(ok)));
+  } catch(e) { alert(e.message); }
+}
+
+// ─── σ_ref IV 面板 ──────────────────────────────────────────────────────────
+let _sigma_table_rows = [];
+async function loadSigmaRef() {
+  const tbody = document.getElementById('sigma-body');
+  if (!tbody) return;
+  try {
+    const res = await fetch('/api/sigma_ref');
+    const data = await res.json();
+    const rows = data.rows || [];
+    const def = data.default || 0.25;
+    _sigma_table_rows = rows.map(r => ({sym:r.symbol, sigma: (r.sigma_ref == null || isNaN(r.sigma_ref)) ? def*100 : r.sigma_ref*100, held: (r.held ?? true), effective: ((r.effective || def))*100}));
+    let html = '';
+    for (const r of _sigma_table_rows) {
+      const filled = r.held && r.sigma != null && r.sigma > 0;
+      const status = r.held && r.sigma == null ? '🟡待填' : (filled ? '✅' : '');
+      const inputVal = filled ? Math.round(r.sigma) : '';
+      const readonly = !r.held ? 'disabled' : '';
+      html += `<tr><td style="padding:6px 8px;text-align:left;font-weight:600;">${r.sym}${r.held&&r.sigma==null?' <span style="color:#fbbf24">🟡</span>':''}</td><td style="padding:6px 8px;text-align:right;"><input type="number" min="5" max="150" step="1" ${readonly} onchange="onSigmaRowChange('${r.sym}',this.value)" value="${inputVal}" style="width:70px;text-align:right;"></td><td style="padding:6px 8px;text-align:center;color:#93c5fd;">${status||''}</td></tr>`;
+    }
+    tbody.innerHTML = html;
+    // 检查弹窗缺失
+    await checkSigmaModal();
+  } catch(e) { console.error(e); }
+}
+
+function onSigmaRowChange(sym, val) {
+  const idx = _sigma_table_rows.findIndex(r => r.sym === sym);
+  if (idx !== -1) {
+    const v = parseInt(val);
+    if (v >= 5 && v <= 150) {
+      _sigma_table_rows[idx].sigma = v;
+    } else {
+      _sigma_table_rows[idx].sigma = null;
+    }
+  }
+}
+
+async function saveSigmaRef() {
+  const tableRows = _sigma_table_rows.map(r => `${r.sym},${Math.round(r.sigma||0)}`).join('\n');
+  try {
+    const res = await fetch('/api/sigma_ref/save', {method:'POST', headers:{'Content-Type':'text/plain'}, body:tableRows});
+    const ok = await res.json();
+    alert(ok.ok ? '已落盘至 '+ok.csv_path : ('保存失败:'+JSON.stringify(ok)));
+  } catch(e) { alert(e.message); }
+}
+
+// ─── σ_ref 弹窗 ───────────────────────────────────────────────────────────
+async function checkSigmaModal() {
+  try {
+    const res = await fetch('/api/sigma_ref/pending');
+    const data = await res.json();
+    const missing = data.missing || [];
+    if (missing.length > 0) {
+      const list = document.getElementById('sigma-pending-list');
+      const modal = document.getElementById('sigma-modal');
+      list.innerHTML = missing.map(s => '<li>'+s+'（当前默认 25%）</li>').join('');
+      modal.style.display = 'block';
+      window._sigma_pending = missing;
+    }
+  } catch(e) {}
+}
+
+function dismissSigmaModal(ignoreToday) {
+  const modal = document.getElementById('sigma-modal');
+  modal.style.display = 'none';
+  if (ignoreToday && window._sigma_pending && window._sigma_pending.length) {
+    fetch('/api/sigma_ref/ack', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({symbols:window._sigma_pending})}).catch(()=>{});
+  }
+}
+
 
 // ─── 列配置面板渲染 ──────────────────────────────────────────────────────────
 function renderColConfigPanel() {

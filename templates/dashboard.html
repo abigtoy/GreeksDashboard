@@ -185,6 +185,26 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
 .modal-btns .btn { padding: 8px 24px; font-size: 13px; }
 .btn-reconnect { background: #16a34a; color: #fff; }
 .btn-reconnect:hover { background: #15803d; }
+
+/* 监控预警组件：σ_ref 弹窗 + 设置页签 */
+#sigma-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 2000; align-items: center; justify-content: center; }
+#sigma-modal.show { display: flex !important; }
+.settings-tab-content { margin-top: 16px; }
+.settings-tab-content h3 { color: #4a9eff; font-size: 14px; margin-bottom: 10px; }
+.settings-tab-content .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.settings-tab-content .field label { color: #8ba3b8; font-size: 11px; }
+.settings-tab-content .field input, .settings-tab-content select { background: #0f1419; border: 1px solid #2a3a4a; color: #e8e8e8; padding: 6px 10px; font-size: 12px; border-radius: 4px; outline: none; }
+.settings-tab-content .btn-save { background: #16a34a; color: #fff; border: none; padding: 6px 18px; font-size: 12px; cursor: pointer; border-radius: 4px; }
+.settings-tab-content .btn-save:hover { background: #15803d; }
+.settings-tab-content .small { color: #64748b; font-size: 11px; margin-top: 8px; }
+#sigma-table { background: #080e16; border-radius: 6px; overflow: hidden; }
+#sigma-table thead { background: #111b28; }
+#sigma-table th { color: #8ba3b8; font-weight: 500; font-size: 11px; padding: 8px; border-bottom: 1px solid #2a3a4a; }
+#sigma-table tbody tr { border-bottom: 1px solid #1a2535; }
+#sigma-table tbody tr:hover { background: #1a2535; }
+#sigma-table tbody td { font-size: 12px; }
+#sigma-table input[type="number"] { width: 70px; text-align: right; }
+
 .btn-cancel-reconnect { background: #2a3a4a; color: #8ba3b8; }
 .btn-cancel-reconnect:hover { background: #374151; }
 </style>
@@ -220,8 +240,10 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
 <div id="settings-panel">
   <div class="settings-inner">
     <div class="settings-tabs">
-      <button class="settings-tab active" onclick="switchSettingsTab('ctp')">CTP连接</button>
+      <button class="settings-tab active" onclick="switchSettingsTab('ctp')">CTP 连接</button>
       <button class="settings-tab" onclick="switchSettingsTab('cols')">⚙ 列设置</button>
+      <button class="settings-tab" onclick="switchSettingsTab('risk')">🛡 风控阈值</button>
+      <button class="settings-tab" onclick="switchSettingsTab('sigma')">σ_ref IV</button>
     </div>
 
     <!-- CTP 连接面板 -->
@@ -243,6 +265,26 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
     <!-- 列设置面板 -->
     <div id="tab-cols" class="col-config-panel">
       <div class="col-config-grid" id="col-config-list"></div>
+    </div>
+
+    <!-- 风控阈值面板 -->
+    <div id="tab-risk" class="settings-tab-content" style="display:none;">
+      <h3>监控预警阈值（经验值起步，可观察微调）</h3>
+      <div id="risk-thresholds"></div>
+      <div class="btn-row"><button class="btn btn-save" onclick="saveRiskThresholds()">保存</button></div>
+      <p class="small">提示：黄线/红线自动保持单调性（黄 < 红），否则拒收。</p>
+    </div>
+
+    <!-- σ_ref IV 面板 -->
+    <div id="tab-sigma" class="settings-tab-content" style="display:none;">
+      <h3>基准 IV 配置（用于 Δ_leg 计算等）</h3>
+      <p class="small">每品种一个基准 IV，缺失时弹窗提示；手工填写数字后自动检测并落盘。</p>
+      <table id="sigma-table" style="width:100%;border-collapse:collapse;margin-top:10px;">
+        <thead><tr><th style="text-align:left;padding:8px;">品种</th><th style="text-align:right;padding:8px;">σ_ref(%)</th><th style="text-align:center;padding:8px;">生效</th></tr></thead>
+        <tbody id="sigma-body"></tbody>
+      </table>
+      <div class="btn-row" style="margin-top:12px;"><button class="btn btn-save" onclick="saveSigmaRef()">保存 CSV</button></div>
+      <p class="small" style="margin-top:6px;">注意：点击「忽略一次」本月内不再弹该品种；无持仓品种不提示。</p>
     </div>
 
   </div>
@@ -283,6 +325,19 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   </div>
 </div>
 
-<script src="/static/dashboard11.js?v=14"></script>
+<div id="sigma-modal" style="display:none;">
+  <div class="modal-box">
+    <h3>📈 σ_ref 基准 IV 待配置</h3>
+    <p>以下品种有持仓但当前使用默认值 25%，请确认或手动填写：</p>
+    <ul id="sigma-pending-list" style="margin:8px 0 12px;padding-left:20px;color:#fbbf24;"></ul>
+    <p class="small">提示：本月内点击「忽略一次」不再弹窗；无持仓品种不提示。</p>
+    <div class="modal-btns">
+      <button class="btn btn-save" onclick="dismissSigmaModal(true)">今日忽略（不再弹）</button>
+      <button class="btn btn-cancel" onclick="dismissSigmaModal(false)">暂时不管</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/dashboard11.js?v=15"></script>
 </body>
 </html>

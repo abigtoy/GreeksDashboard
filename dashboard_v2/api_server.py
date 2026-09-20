@@ -45,9 +45,11 @@ from vnpy.event import Event
 from vnpy.trader.constant import Direction, Offset, Product, Exchange
 from vnpy_engine import VNPYEngine
 from loguru import logger
-from dashboard_v2.risk_engine import build_tree
+from dashboard_v2.risk_engine import build_tree, normalize_underlying
 from dashboard_v2.pricing import price_options_batch, days_to_expiry
-from dashboard_v2.settlement import SettlementManager, _valid_dates
+from dashboard_v2.settlement import SettlementManager, _valid_dates, _cutoff_date as _sm_cutoff, _scanned_dates as _sm_scanned
+from dashboard_v2.alert_config import load_alert_settings as _load_alerts, save_alert_settings as _save_alerts, get_threshold as _get_thresh
+from dashboard_v2.alert_config import load_sigma_ref as _load_sigma, sigma_ref_missing as _sigma_missing, append_sigma_symbols as _append_sigma
 
 # ── 共享状态（Worker 写，API 读，无锁 Python 对象）────────────────────────────
 # 均为 Python 对象，无锁，Worker 线程写，Flask API 读
@@ -574,25 +576,101 @@ def _worker_loop(settlement_dir: str):
         _settlement_manager.load_costs_from_meta()
     # F2: 重启后重放成交账本（当日已实现盈亏不因重启归零）
     _load_trade_ledger(_ctp_trading_day())
-    _local_complete = (
-        len(_settlement_manager._cost_cache) > 0
-        and _settlement_manager._meta.get("loaded", False)
-    )
-
-    def _do_settlement_sync():
-        nonlocal _local_complete
+    
+    # ── 结算单同步逻辑（修复两个 bug）──────────────────────────────────────
+    # Bug 1: `_local_complete`一票否决 → 只看历史缓存，不看当天是否已入库 → 20:20 后再也不下载当天结算单
+    # Bug 2: sync 只在连接成功时触发一次 → 20:00 后无路径再触发
+    # Fix: 把静态标记改成函数 + 每日重检（每 10 分钟），同时保留连接时的立即触发
+    # ---------------------------------------------------------------------
+    
+    _SYNC_GATE_MIN    = 20 * 60 + 20      # 20:20 起当日结算单可查（单位：分钟）
+    _SYNC_RETRY_SEC   = 600               # 缺当天结算单则每 10 分钟重试一次
+    
+    _sync_state = {"running": False, "last_try": 0.0, "done_day": None}
+    
+    
+    def _today_settlement_present() -> bool:
+        """当天结算单是否已入库（口径：有 full_{date}.json 即已下载）。"""
         try:
-            # 本地数据齐全时，跳过网络请求
-            if _local_complete:
-                logger.info("[结算单] 本地数据已齐全，跳过 sync")
+            return _sm_cutoff() in _sm_scanned()
+        except Exception:
+            return False
+    
+    
+    def _local_settlement_complete() -> bool:
+        """
+        本地是否齐全 —— 必须同时检查"当天"。
+        否则 13:25 连上时历史缓存在 → 判定齐全 → 当晚 20:20 后再也不下载当天结算单。
+        """
+        if not _settlement_manager._cost_cache:
+            return False
+        if not _settlement_manager._meta.get("loaded", False):
+            return False
+        
+        now = datetime.datetime.now()
+        if now.hour * 60 + now.minute >= _SYNC_GATE_MIN:
+            if not _today_settlement_present():
+                return False
+        
+        return True
+    
+    
+    def _do_settlement_sync():
+        """后台线程目标：执行增量同步并更新 meta。已在调用处启动 daemon 线程。"""
+        global _sync_state
+        
+        if _sync_state["running"]:
+            return
+        _sync_state["running"] = True
+        try:
+            if _local_settlement_complete():
+                logger.info("[结算单] 本地数据已齐全（含当天），跳过 sync")
                 return
+            
             sync_result = _settlement_manager.sync()
             logger.info(f"[结算单] sync_result={sync_result}")
-            # sync 成功后标记为完整
-            if sync_result.get("missing_filled") or sync_result.get("today_updated"):
-                _local_complete = True
+            
+            # 若成功或当天已入库，则标记本日 done（避免重复尝试）
+            if sync_result.get("today_updated") or _today_settlement_present():
+                _sync_state["done_day"] = _sm_cutoff()
         except Exception as e:
-            logger.error(f"[结算单] sync 异常: {e}")
+            logger.error(f"[结算单] sync 异常：{e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        finally:
+            _sync_state["running"] = False
+    
+    
+    def _maybe_settlement_sync():
+        """
+        每天 20:20 后自动触发一次当天结算单下载（独立于连接时刻）。
+        - 只在 connected 且已过闸门时间时尝试
+        - 每 _SYNC_RETRY_SEC 秒重试一次，直到当天文件入库
+        - 已有 sync 在跑则不重复起线程
+        """
+        now = datetime.datetime.now()
+        if now.hour * 60 + now.minute < _SYNC_GATE_MIN:
+            return
+        
+        today_str = _sm_cutoff()
+        
+        # 今日已完成？返回
+        if _sync_state["done_day"] == today_str and _today_settlement_present():
+            return
+        
+        # 已在运行？
+        if _sync_state["running"]:
+            return
+        
+        # 距离上次尝试不足 _SYNC_RETRY_SEC？
+        if time.time() - _sync_state["last_try"] < _SYNC_RETRY_SEC:
+            return
+        
+        _sync_state["last_try"] = time.time()
+        threading.Thread(target=_do_settlement_sync, daemon=True).start()
+        logger.info("[结算单] 启动每日重试线程（20:20 后）")
+    
+
 
     attempts = 0
     disconnect_retry_count = 0   # 记录连续掉线次数（用于自动重连上限）
@@ -661,6 +739,10 @@ def _worker_loop(settlement_dir: str):
                         return
                 # 每次轮询都取最新结算数据（sync 线程可能已更新 _settlement_manager）
                 _settlement_manager.load_costs_from_meta()   # 确保缓存是最新的
+                
+                # ★ 每天 20:20 后自动触发一次当天结算单下载（独立于连接时刻）
+                _maybe_settlement_sync()
+                
                 settlement_data    = _settlement_manager.get_all_costs()
                 settlement_prices = _settlement_manager.get_all_prices()
                 if len(settlement_data) == 0:
@@ -996,6 +1078,9 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             "size":          contract.size,
             **greeks_flat,
         })
+    
+    # ── 记录持仓品种集合（用于 σ_ref 弹窗，规范化到品种码）──────────────────
+    held_products = sorted({normalize_underlying(p["symbol"].split('.')[0]) for p in positions_out})
 
     # ── 构造 ticks（格式对齐 build_tree 期望）────────────────────────────────
     # ticks 格式: {symbol: {last_price, underlying_price, iv}}
@@ -1093,6 +1178,39 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         _shared_state["settlement_prices"] = settlement_prices_dict
         _shared_state["account"] = account_data
         _shared_state["last_update"] = datetime.datetime.now()
+        # 监控预警：持仓品种集合 + σ_ref 缺失 + Margin 状态
+        if held_products:
+            _shared_state["_held_products"] = held_products
+            from dashboard_v2.alert_config import sigma_ref_missing
+            pending = sigma_ref_missing(held_products)
+            if pending:
+                logger.info(f"[alert] σ_ref 待填品种（本月免打扰后）:{pending}")
+            else:
+                logger.debug("[alert] σ_ref 全量已填")
+        # Margin 风险度分档（95%/110% 两级）
+        margin_ratio = None
+        margin_headroom = None
+        level = "unknown"
+        if account_data:
+            m = get_threshold("margin_ratio_warn")
+            d = get_threshold("margin_ratio_danger")
+            bal = account_data.get("balance", 0) or 0
+            mg = account_data.get("margin", 0) or 0
+            if bal > 0:
+                ratio_pct = mg / bal * 100.0
+                if ratio_pct >= d:
+                    level = "danger"
+                elif ratio_pct >= m:
+                    level = "warn"
+                else:
+                    level = "ok"
+                margin_ratio = round(ratio_pct, 2)
+                margin_headroom = round(bal * d / 100.0 - mg, 2)
+        _shared_state["margin_status"] = {
+            "ratio_pct": margin_ratio,
+            "headroom": margin_headroom,
+            "level": level,
+        }
 
 
 # ── Flask Blueprint ──────────────────────────────────────────────────────────
@@ -1791,6 +1909,99 @@ def create_app(settlement_dir: str = "结算单", static_folder=None, template_f
         with _shared_lock:
             _shared_state["column_config"] = cols
         return jsonify({"ok": True})
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 监控预警配置：阈值 + σ_ref
+    # ══════════════════════════════════════════════════════════════════════════
+    @app.route("/api/alert/settings")
+    def _get_alert_settings():
+        """返回当前阈值配置（含默认区间，供前端渲染设置菜单）。"""
+        from dashboard_v2.alert_config import THRESHOLD_SPEC, DEFAULT_SETTINGS
+        cur = _load_alerts(force=False)
+        return jsonify({
+            "settings": cur,
+            "defaults": DEFAULT_SETTINGS,
+            "spec": {k: {"lo": v["lo"], "hi": v["hi"], "step": v["step"], "label": v["label"]}
+                     for k, v in THRESHOLD_SPEC.items()},
+        })
+
+    @app.route("/api/alert/settings", methods=["POST"])
+    def _save_alert_settings():
+        """保存阈值（部分更新即可）。"""
+        patch_data = request.get_json(silent=True) or {}
+        if not isinstance(patch_data, dict):
+            return jsonify({"error": "invalid payload"}), 400
+        saved = _save_alerts(patch_data)
+        return jsonify({"ok": True, "settings": saved})
+
+    @app.route("/api/sigma_ref")
+    def _get_sigma_ref():
+        """σ_ref 全量 + 空缺清单（供设置页签渲染 CSV 内容）。"""
+        from dashboard_v2.alert_config import sigma_ref_pending, SIGMA_DEFAULT, SIGMA_CSV
+        with _shared_lock:
+            held = list(_shared_state.get("_held_products", []))
+        rows = sigma_ref_pending(held or list(_load_sigma().keys()))
+        # 把「有值但当前无持仓」的也返回，避免用户看不到自己填的行
+        table = _load_sigma()
+        held_set = {r["symbol"] for r in rows}
+        for sym in sorted(table.keys()):
+            if sym not in held_set:
+                rows.append({"symbol": sym, "sigma_ref": table[sym],
+                             "effective": table[sym], "source": "config", "held": False})
+        for r in rows:
+            r.setdefault("held", True)
+        return jsonify({"rows": rows, "default": SIGMA_DEFAULT, "csv_path": SIGMA_CSV})
+
+    @app.route("/api/sigma_ref/pending")
+    def _get_sigma_pending():
+        """弹窗专用：仅返回「有持仓但待填」的品种（已扣「忽略一次」）。"""
+        with _shared_lock:
+            held = list(_shared_state.get("_held_products", []))
+        return jsonify({"missing": _sigma_missing(held)})
+
+    @app.route("/api/sigma_ref/ack", methods=["POST"])
+    def _post_sigma_ack():
+        """「忽略一次」：本月内不再弹该品种。"""
+        from dashboard_v2.alert_config import save_sigma_ack, current_month_key
+        data = request.get_json(silent=True) or {}
+        syms = data.get("symbols") or []
+        if not isinstance(syms, list) or not syms:
+            return jsonify({"error": "symbols 必填（数组）"}), 400
+        acked = save_sigma_ack([str(s) for s in syms])
+        return jsonify({"ok": True, "month": current_month_key(), "acked": acked})
+
+    @app.route("/api/sigma_ref/save", methods=["POST"])
+    def _save_sigma_ref_csv():
+        """用户从前端面板手动提交 CSV 内容（纯文本保存）。"""
+        raw = request.data.decode('utf-8')
+        lines = [l.strip() for l in raw.split('\\n') if l.strip() and not l.strip().startswith('#')]
+        if not lines:
+            return jsonify({"error": "empty content"}), 400
+        try:
+            import csv
+            import os as _os
+            from dashboard_v2.alert_config import CONFIG_DIR
+            path = _os.path.join(CONFIG_DIR, "iv_sigma_ref.csv")
+            _os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+                for line in lines:
+                    # parse CSV row -> normalize symbol -> clamp sigma
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) < 2:
+                        continue
+                    sym = parts[0].strip().upper()
+                    sigma_val = float(parts[1].strip())
+                    if sigma_val > 1.5:
+                        sigma_val = sigma_val / 100.0
+                    if not (0.02 <= sigma_val <= 1.50):
+                        continue
+                    f.write(f"{sym},{sigma_val:.4f}\\n")
+            from dashboard_v2.alert_config import load_sigma_ref
+            load_sigma_ref(force=True)
+            return jsonify({"ok": True, "csv_path": path, "rows_saved": len(lines)})
+        except Exception as e:
+            import traceback
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/debug/pos")
     def _debug_pos():
