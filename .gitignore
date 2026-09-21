@@ -23,6 +23,9 @@ __pycache__/
 # Logs and temp
 *.log
 *.tmp
+# Windows 保留名：MSYS 下 `>nul` 会真建出名为 nul 的文件，git add -A 会因此整体中止
+nul
+restart_v*.out
 
 # OS
 .DS_Store

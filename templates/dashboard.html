@@ -189,6 +189,45 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
 /* 监控预警组件：σ_ref 弹窗 + 设置页签 */
 #sigma-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 2000; align-items: center; justify-content: center; }
 #sigma-modal.show { display: flex !important; }
+/* 告警行变色 */
+tr.alert-warn   > td { background: rgba(251,191,36,0.16) !important; }
+tr.alert-danger > td { background: rgba(239,68,68,0.20) !important; }
+tr.alert-warn   > td.tree-cell { border-left: 3px solid #fbbf24; }
+tr.alert-danger > td.tree-cell { border-left: 3px solid #ef4444; }
+/* 告警单元格变色（F→标的价、IV→IV%、Burn→当日盈亏） */
+td.alert-warn   { background: rgba(251,191,36,0.16) !important; box-shadow: inset 0 0 0 1px rgba(251,191,36,0.55); }
+td.alert-danger { background: rgba(239,68,68,0.20) !important; box-shadow: inset 0 0 0 1px rgba(239,68,68,0.65); }
+/* 风险度数字块（账户级 Margin） */
+.summary-item .value.alert-warn   { background: rgba(251,191,36,0.16) !important; color: #fbbf24 !important; border-radius: 4px; }
+.summary-item .value.alert-danger { background: rgba(239,68,68,0.20) !important; color: #ef4444 !important; border-radius: 4px; }
+/* 告警记录弹窗 */
+#alert-list-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 2500; align-items: center; justify-content: center; }
+#alert-list-modal.show { display: flex !important; }
+#alert-list-modal .alert-list-box { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; width: min(880px, 92vw); max-height: 80vh; display: flex; flex-direction: column; padding: 16px; }
+#alert-list-modal .alert-list-head { display: flex; align-items: center; justify-content: space-between; font-size: 15px; color: #e8e8e8; margin-bottom: 10px; }
+#alert-list-modal .alert-list-close { background: none; border: none; color: #888; font-size: 16px; cursor: pointer; }
+#alert-list-modal .alert-list-close:hover { color: #fff; }
+#alert-list-modal .alert-list-filters { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+#alert-list-modal .alert-list-filters select { background: #0f1419; border: 1px solid #2a3a4a; color: #e8e8e8; padding: 5px 8px; font-size: 12px; border-radius: 4px; outline: none; }
+#alert-list-modal .alert-list-body-wrap { overflow-y: auto; font-size: 12px; }
+#alert-list-modal table { width: 100%; border-collapse: collapse; }
+#alert-list-modal th, #alert-list-modal td { padding: 5px 8px; text-align: left; border-bottom: 1px solid #2a2a2a; }
+#alert-list-modal th { color: #888; font-weight: 600; position: sticky; top: 0; background: #1a1a1a; }
+/* 告警 toast 容器 */
+#alert-toasts { position: fixed; right: 16px; bottom: 16px; z-index: 3000; display: flex; flex-direction: column; gap: 8px; max-width: 380px; }
+.alert-toast { padding: 10px 14px; border-radius: 6px; color: #fff; font-size: 13px; box-shadow: 0 4px 14px rgba(0,0,0,0.4); display: flex; align-items: flex-start; gap: 10px; }
+.alert-toast.warn   { background: #b45309; border-left: 4px solid #fbbf24; }
+.alert-toast.danger { background: #991b1b; border-left: 4px solid #ef4444; }
+.alert-toast .toast-close { cursor: pointer; font-weight: 700; opacity: .8; margin-left: auto; }
+.alert-toast .toast-close:hover { opacity: 1; }
+/* 告警历史 */
+#alert-history-wrap { margin-top: 18px; border-top: 1px solid #333; padding-top: 12px; }
+#alert-history-wrap .ah-head { cursor: pointer; color: #4a9eff; font-size: 14px; margin-bottom: 8px; user-select: none; }
+#alert-history { max-height: 260px; overflow-y: auto; font-size: 12px; }
+#alert-history table { width: 100%; border-collapse: collapse; }
+#alert-history th, #alert-history td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #2a2a2a; }
+#alert-history th { color: #888; font-weight: 600; position: sticky; top: 0; background: #1a1a1a; }
+.ah-lv-warn { color: #fbbf24; } .ah-lv-danger { color: #ef4444; font-weight: 700; }
 .settings-tab-content { margin-top: 16px; }
 .settings-tab-content h3 { color: #4a9eff; font-size: 14px; margin-bottom: 10px; }
 .settings-tab-content .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
@@ -272,12 +311,14 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
       <h3>监控预警阈值（经验值起步，可观察微调）</h3>
       <div id="risk-thresholds"></div>
       <div class="btn-row"><button class="btn btn-save" onclick="saveRiskThresholds()">保存</button></div>
-      <p class="small">提示：黄线/红线自动保持单调性（黄 < 红），否则拒收。</p>
+      <p class="small">提示：黄线/红线自动保持单调性（黄 &lt; 红），否则拒收。</p>
+      <!-- 告警记录：按钮开弹窗（可排序 / 按等级 · 品种筛选） -->
+      <div class="btn-row"><button class="btn" onclick="openAlertList()">📋 查看告警记录</button></div>
     </div>
 
     <!-- σ_ref IV 面板 -->
     <div id="tab-sigma" class="settings-tab-content" style="display:none;">
-      <h3>基准 IV 配置（用于 Δ_leg 计算等）</h3>
+      <h3>基准 IV（σ_ref）</h3>
       <p class="small">每品种一个基准 IV，缺失时弹窗提示；手工填写数字后自动检测并落盘。</p>
       <table id="sigma-table" style="width:100%;border-collapse:collapse;margin-top:10px;">
         <thead><tr><th style="text-align:left;padding:8px;">品种</th><th style="text-align:right;padding:8px;">σ_ref(%)</th><th style="text-align:center;padding:8px;">生效</th></tr></thead>
@@ -298,6 +339,7 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   <div class="summary-item"><div class="label">当日盈亏</div><div class="value pnl" id="sumPnlT">-</div></div>
   <div class="summary-item"><div class="label">浮动盈亏</div><div class="value pnl" id="sumPnlH">-</div></div>
   <div class="summary-item"><div class="label">持仓数</div><div class="value" id="posCount">-</div></div>
+  <div class="summary-item"><div class="label">风险度</div><div class="value" id="sumMargin">-</div></div>
 </div>
 
 
@@ -338,6 +380,30 @@ tr.total-row td { color: #e8e8e8; font-size: 12px; }
   </div>
 </div>
 
-<script src="/static/dashboard11.js?v=15"></script>
+<div id="alert-toasts"></div>
+
+<!-- 告警记录弹窗：时间排序 / 等级筛选 / 品种筛选 -->
+<div id="alert-list-modal">
+  <div class="alert-list-box">
+    <div class="alert-list-head">
+      <span>告警记录 <span id="alert-list-count">(0/0)</span></span>
+      <button class="alert-list-close" onclick="closeAlertList()">✕</button>
+    </div>
+    <div class="alert-list-filters">
+      <select id="alert-f-lv" onchange="onAlertFilterChange()">
+        <option value="">全部等级</option>
+        <option value="warn">黄</option>
+        <option value="danger">红</option>
+      </select>
+      <select id="alert-f-sym" onchange="onAlertFilterChange()"><option value="">全部品种</option></select>
+      <button class="btn" onclick="toggleAlertSort()">时间 ↓</button>
+    </div>
+    <div class="alert-list-body-wrap">
+      <table><thead><tr><th>时间</th><th>源</th><th>品种</th><th>合约</th><th>级</th><th>值</th><th>低点 → 报警点</th><th>阈值</th></tr></thead><tbody id="alert-list-body"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<script src="/static/dashboard11.js?v=23"></script>
 </body>
 </html>

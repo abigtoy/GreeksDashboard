@@ -26,6 +26,7 @@ CONFIG_DIR = os.path.join(_PARENT, "config")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "alert_settings.json")
 SIGMA_CSV     = os.path.join(CONFIG_DIR, "iv_sigma_ref.csv")
 SIGMA_ACK     = os.path.join(CONFIG_DIR, "sigma_ref_ack.json")
+HOURS_CSV     = os.path.join(CONFIG_DIR, "trading_hours.csv")   # 各品种交易时段 + 总时长
 
 # 默认 σ_ref（找不到任何记录时的最终兜底）
 SIGMA_DEFAULT = 0.25
@@ -33,10 +34,14 @@ SIGMA_DEFAULT = 0.25
 # ── 阈值默认值（经验值起步）+ 允许调节范围（防手滑）────────────────────────
 #   lo/hi 为闭区间；step 供前端滑杆/输入框用
 THRESHOLD_SPEC = {
-    "f_rate_warn":        {"lo": 0.10, "hi": 1.00, "step": 0.05, "label": "F 速率·黄（ΔlnF/σ√T）"},
-    "f_rate_danger":      {"lo": 0.15, "hi": 1.50, "step": 0.05, "label": "F 速率·红（ΔlnF/σ√T）"},
-    "iv_rate_warn":       {"lo": 0.50, "hi": 5.00, "step": 0.10, "label": "ATM IV 速率·黄（vol/5min）"},
-    "net_delta_warn":     {"lo": 1,    "hi": 50,   "step": 1,    "label": "品种净 Δ 限额（手）"},
+    "f_rate_warn":        {"lo": 0.50, "hi": 12.00, "step": 0.50, "label": "F 速率·黄（倍）"},
+    "f_rate_danger":      {"lo": 0.50, "hi": 20.00, "step": 0.50, "label": "F 速率·红（倍）"},
+    "iv_rate_warn":       {"lo": 0.50, "hi": 50.00, "step": 0.50, "label": "ATM IV 速率·黄（%）"},
+    # 结构风险：单腿 |换算Δ| ≥ 黄线 → 黄；该腿越界实值（K 与 F 异侧）→ 红（不需另设阈值）
+    #   换算Δ = 固定 σ_ref 的 Black-76 Δ（口径稳定），非看板 Δ 列的市场 Δ
+    "conv_delta_warn":    {"lo": 0.10, "hi": 0.90, "step": 0.05, "label": "单腿 |换算Δ|·黄（红=该腿已实值）"},
+    # Delta monitoring disabled — set to 10000 to never trigger; TODO future extension
+    "net_delta_warn":     {"lo": 10000, "hi": 10000, "step": 1, "label": "品种净 Δ 限额（手） [已禁用]"},
     "burn_warn":          {"lo": 0.05, "hi": 0.60, "step": 0.05, "label": "Premium Burn·黄"},
     "burn_danger":        {"lo": 0.10, "hi": 1.00, "step": 0.05, "label": "Premium Burn·红"},
     "margin_ratio_warn":  {"lo": 50,   "hi": 100,  "step": 1,    "label": "风险度·黄（%）"},
@@ -44,10 +49,12 @@ THRESHOLD_SPEC = {
 }
 
 DEFAULT_SETTINGS = {
-    "f_rate_warn":         0.30,
-    "f_rate_danger":       0.50,
-    "iv_rate_warn":        1.50,
-    "net_delta_warn":      10,
+    "f_rate_warn":         3.00,
+    "f_rate_danger":       5.00,
+    "iv_rate_warn":        5.00,
+    "conv_delta_warn":     0.42,
+    # Delta monitoring effectively disabled via high threshold
+    "net_delta_warn":      10000,
     "burn_warn":           0.20,
     "burn_danger":         0.50,
     "margin_ratio_warn":   95,
@@ -58,6 +65,8 @@ DEFAULT_SETTINGS = {
 _settings_cache: dict | None = None
 _sigma_cache: dict[str, float] = {}
 _sigma_mtime: float = 0.0
+_hours_cache: dict[str, dict] = {}
+_hours_mtime: float = -1.0
 
 
 def _clamp_clip(key: str, val: float) -> float:
@@ -92,7 +101,7 @@ def load_alert_settings(force: bool = False) -> dict:
                 raw = json.load(f)
             for k, v in (raw or {}).items():
                 if k in merged and isinstance(v, (int, float)):
-                    merged[k] = _clamp_clip(k, float(v))
+                    merged[k] = float(v)   # 不做区间夹取，读盘原值
     except Exception as e:
         logger.error(f"[alert_config] 阈值配置读取失败，用默认经验值: {e}")
 
@@ -133,7 +142,7 @@ def save_alert_settings(patch: dict) -> dict:
             if fv < new_warn:
                 logger.warning(f"[alert_config] {k}={fv} < {warn_key}={new_warn}，拒收")
                 continue
-        fv = _clamp_clip(k, fv)
+        # 不做区间夹取：用户填什么就存什么
         if cur[k] != fv:
             changed.append(k)
         cur[k] = fv
@@ -235,6 +244,67 @@ def get_sigma(product: str) -> tuple[float, str]:
     if key in table:
         return table[key], "config"
     return SIGMA_DEFAULT, "default"
+
+
+def load_trading_hours(force: bool = False) -> dict[str, dict]:
+    """
+    读取 trading_hours.csv → {SYMBOL(大写): {exchange, name, sessions, hours}}。
+    - `sessions` 是原始时段串列表（如 ['09:00-10:15','10:30-11:30','13:30-15:00','21:00-23:00']），
+      跨零点时段按原样保留（'21:00-02:30'），需要分钟数的调用方自行 +24h。
+    - 键用 _norm_symbol（大写），**不走 normalize_underlying** ——
+      CFFEX_MAP 会把 MO→IM / IO→IF / HO→IH，与 IM/IF/IH 那几行撞车。
+    - 文件 mtime 变化时自动重载（手工改完 CSV 不用重启服务）。
+    """
+    global _hours_cache, _hours_mtime
+    try:
+        mtime = os.path.getmtime(HOURS_CSV) if os.path.exists(HOURS_CSV) else 0.0
+    except OSError:
+        mtime = 0.0
+
+    if not force and mtime == _hours_mtime:
+        return dict(_hours_cache)
+
+    out: dict[str, dict] = {}
+    try:
+        if os.path.exists(HOURS_CSV):
+            with open(HOURS_CSV, encoding="utf-8-sig", newline="") as f:
+                for row in csv.DictReader(f):
+                    sym = _norm_symbol(row.get("品种"))
+                    if not sym:
+                        continue
+                    try:
+                        h = float((row.get("总时长(h)") or "").strip())
+                    except (TypeError, ValueError):
+                        continue
+                    if h <= 0:
+                        continue
+                    out[sym] = {
+                        "exchange": _norm_symbol(row.get("交易所")),
+                        "name": (row.get("名称") or "").strip(),
+                        "sessions": [
+                            s for s in (
+                                (row.get(f"交易时段{i}") or "").strip() for i in (1, 2, 3, 4)
+                            ) if s
+                        ],
+                        "hours": h,
+                    }
+    except Exception as e:
+        logger.error(f"[alert_config] 交易时段 CSV 读取失败: {e}")
+
+    _hours_cache = out
+    _hours_mtime = mtime
+    return dict(out)
+
+
+def get_trading_hours(product: str) -> dict | None:
+    """取某品种整行配置 {exchange, name, sessions, hours}。查不到 → None。"""
+    return load_trading_hours().get(_norm_symbol(product))
+
+
+def hours_of(product: str, fallback: float | None = None) -> float | None:
+    """取某品种日交易总时长（小时）。查不到 → fallback。"""
+    row = get_trading_hours(product)
+    return row["hours"] if row else fallback
 
 
 def sigma_ref_pending(held_products: list[str]) -> list[dict]:

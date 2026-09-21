@@ -257,18 +257,47 @@ async function doConnect() {
   btn.className = 'btn btn-ctp pending';
   btn.textContent = '○ 连接中…';
   setMsg('正在连接，请等待...', 'info');
+
+  // 表单输入框不存在时，回退到 /api/ctp/config 的已保存配置
+  var userEl = document.getElementById('f-user');
+  var passEl = document.getElementById('f-pass');
+  var brokerEl = document.getElementById('f-broker');
+  var tdEl = document.getElementById('f-td');
+  var mdEl = document.getElementById('f-md');
+  var productEl = document.getElementById('f-product');
+  var authEl = document.getElementById('f-auth');
+
+  var payload = {
+    '用户名':     (userEl && userEl.value) ? userEl.value.trim() : '',
+    '密码':       (passEl && passEl.value) ? passEl.value : '',
+    '经纪商代码': (brokerEl && brokerEl.value) ? brokerEl.value.trim() : '',
+    '交易服务器': (tdEl && tdEl.value) ? tdEl.value.trim() : '',
+    '行情服务器': (mdEl && mdEl.value) ? mdEl.value.trim() : '',
+    '产品名称':   (productEl && productEl.value) ? productEl.value.trim() : '',
+    '授权编码':   (authEl && authEl.value) ? authEl.value.trim() : '',
+  };
+
+  // 若任一字段为空，尝试从后端读取已保存配置补全
+  var hasEmpty = Object.values(payload).some(function(v){ return !v; });
+  if (hasEmpty) {
+    try {
+      var cfg = await fetch_json('/api/ctp/config');
+      if (cfg) {
+        if (!payload['用户名']) payload['用户名'] = cfg['用户名'] || '';
+        if (!payload['密码']) payload['密码'] = cfg['密码'] || '';
+        if (!payload['经纪商代码']) payload['经纪商代码'] = cfg['经纪商代码'] || '';
+        if (!payload['交易服务器']) payload['交易服务器'] = cfg['交易服务器'] || '';
+        if (!payload['行情服务器']) payload['行情服务器'] = cfg['行情服务器'] || '';
+        if (!payload['产品名称']) payload['产品名称'] = cfg['产品名称'] || '';
+        if (!payload['授权编码']) payload['授权编码'] = cfg['授权编码'] || '';
+      }
+    } catch(e) { console.warn('[ctp] 回退读取配置失败', e); }
+  }
+
   var result = await fetch_json('/api/ctp/connect', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      '用户名':     document.getElementById('f-user').value.trim(),
-      '密码':       document.getElementById('f-pass').value,
-      '经纪商代码': document.getElementById('f-broker').value.trim(),
-      '交易服务器': document.getElementById('f-td').value.trim(),
-      '行情服务器': document.getElementById('f-md').value.trim(),
-      '产品名称':   document.getElementById('f-product').value.trim(),
-      '授权编码':   document.getElementById('f-auth').value.trim(),
-    })
+    body: JSON.stringify(payload)
   });
   // 成功→3s 轮询接管状态；失败→就地复位
   if (!result || !result.success) {
@@ -317,9 +346,119 @@ async function fetchDashboard() {
 
     render();
     updateHeader();
+    handleAlerts(State.snapshot);
   } catch(e) {
     console.error('[poll]', e);
   }
+}
+
+// ─── 监控预警：toast 弹窗 + 告警记录弹窗 ────────────────────────────────────
+const _seenAlertIds = new Set();     // 前端去重：同一 popup 只弹一次
+
+// 合约代码 → 品种（后端 contract_und 为权威，MO→IM 等别名由后端归一；缺失时按去分隔符/数字兜底）
+function undOf(code) {
+  const m = (State.snapshot && State.snapshot.contract_und) || {};
+  const bare = String(code || '').split('.')[0];
+  if (m[bare]) return m[bare];
+  return bare.replace(/[_-].*$/, '').replace(/\d.*$/, '');
+}
+
+function handleAlerts(snap) {
+  if (!snap) return;
+  // 1) 弹窗（后端已做冷却/计数，这里只负责展示 + 前端去重）
+  const popups = snap.popups || [];
+  for (const p of popups) {
+    const key = p.alert_id + '|' + p.ts;
+    if (_seenAlertIds.has(key)) continue;
+    _seenAlertIds.add(key);
+    showAlertToast(p);
+  }
+  // 2) 告警记录弹窗若开着 → 实时刷新
+  const modal = document.getElementById('alert-list-modal');
+  if (modal && modal.classList.contains('show')) renderAlertList();
+}
+
+function showAlertToast(p) {
+  const box = document.getElementById('alert-toasts');
+  if (!box) return;
+  const div = document.createElement('div');
+  div.className = 'alert-toast ' + (p.level === 'danger' ? 'danger' : 'warn');
+  div.innerHTML = `<span>${p.msg}</span><span class="toast-close">✕</span>`;
+  div.querySelector('.toast-close').addEventListener('click', ev => { ev.stopPropagation(); div.remove(); });
+  div.addEventListener('click', () => openAlertList());
+  box.appendChild(div);
+  // 最多同时挂 6 条，超出丢弃最旧的
+  while (box.children.length > 6) box.removeChild(box.firstChild);
+}
+
+// ─── 告警记录弹窗（时间排序 / 等级筛选 / 品种筛选）──────────────────────────
+let _alertSortDesc = true;
+
+function openAlertList() {
+  const m = document.getElementById('alert-list-modal');
+  if (!m) return;
+  renderAlertList();
+  m.classList.add('show');
+}
+
+function closeAlertList() {
+  const m = document.getElementById('alert-list-modal');
+  if (m) m.classList.remove('show');
+}
+
+function toggleAlertSort() {
+  _alertSortDesc = !_alertSortDesc;
+  renderAlertList();
+}
+
+function onAlertFilterChange() {
+  renderAlertList();
+}
+
+// 告警源中文名（弹窗/历史表统一用；conv_delta 源报的是「换算Δ」= 固定 σ_ref 下的 Δ，
+// 与看板 Δ 列的市场 Δ 不是一个东西）
+const SRC_LABEL = { f_rate: 'F速率', iv_rate: 'IV速率', burn: 'Burn', conv_delta: '换算Δ', margin: '风险度' };
+
+function renderAlertList() {
+  const tbody = document.getElementById('alert-list-body');
+  if (!tbody) return;
+  const all = (State.snapshot && State.snapshot.alerts) || [];
+  const lvSel = document.getElementById('alert-f-lv');
+  const symSel = document.getElementById('alert-f-sym');
+  const wantLv = lvSel ? lvSel.value : '';
+  const wantSym = symSel ? symSel.value : '';
+
+  // 品种下拉选项（按当天告警里出现过的品种生成，保留用户已选项）
+  if (symSel) {
+    const keys = [...new Set(all.map(a => a.underlying || a.symbol || ''))].filter(Boolean).sort();
+    const cur = symSel.value;
+    symSel.innerHTML = '<option value="">全部</option>' + keys.map(k => `<option value="${k}">${k}</option>`).join('');
+    if (keys.includes(cur) || cur === '') symSel.value = cur;
+  }
+
+  const rows = all.filter(a => (!wantLv || a.level === wantLv)
+    && (!wantSym || (a.underlying || a.symbol) === wantSym));
+  rows.sort((a, b) => {
+    const t = String(a.ts || '').localeCompare(String(b.ts || ''));
+    return _alertSortDesc ? -t : t;
+  });
+
+  const cnt = document.getElementById('alert-list-count');
+  if (cnt) cnt.textContent = `(${rows.length}/${all.length})`;
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:#666;padding:12px;">暂无告警</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(a => {
+    const lvCls = a.level === 'danger' ? 'ah-lv-danger' : 'ah-lv-warn';
+    const lvTxt = a.level === 'danger' ? '红' : '黄';
+    const span = (a.v_from === null || a.v_from === undefined) ? '' : `${a.v_from} → ${a.v_to}`;
+    return `<tr><td>${a.ts ? a.ts.slice(11) : ''}</td><td>${SRC_LABEL[a.source] || a.source || ''}</td>`
+         + `<td>${a.underlying || a.symbol || ''}</td><td>${a.symbol || ''}</td>`
+         + `<td class="${lvCls}">${lvTxt}</td><td>${a.value ?? ''}</td><td>${span}</td>`
+         + `<td>${a.threshold ?? ''}</td></tr>`;
+  }).join('');
 }
 
 function updateHeader() {
@@ -384,12 +523,13 @@ function render() {
 // ─── 树过滤 ──────────────────────────────────────────────────────────────────
 function filterTree(tree, txt) {
   if (!txt || !txt.trim()) return tree;
-  const q = txt.trim().toLowerCase();
-  // 返回 [l1, l2, l3] 全部匹配的节点
+  // 支持多关键字：`au sc im` 或 `au&sc&im`，任一命中即保留（OR）
+  const keywords = txt.trim().split(/[\s&]+/).map(s => s.toLowerCase()).filter(Boolean);
+  if (!keywords.length) return tree;
   const match = (node) =>
-    (node.key && node.key.toLowerCase().includes(q)) ||
-    (node.name && node.name.toLowerCase().includes(q)) ||
-    (node.symbol && node.symbol.toLowerCase().includes(q));
+    (node.key && keywords.some(k => node.key.toLowerCase().includes(k))) ||
+    (node.name && keywords.some(k => node.name.toLowerCase().includes(k))) ||
+    (node.symbol && keywords.some(k => node.symbol.toLowerCase().includes(k)));
 
   return tree
     .map(l1 => {
@@ -472,6 +612,21 @@ function renderSummary(s) {
     el.className = pnlCls(pnlH);
     el.textContent = fmt(pnlH, 0);
   }
+
+  // 风险度（账户级 Margin：黄 95% / 红 110%，仅提示不阻断）
+  const ms = (State.snapshot && State.snapshot.margin_status) || {};
+  const mEl = document.getElementById('sumMargin');
+  if (mEl) {
+    const r = ms.ratio_pct;
+    if (r === null || r === undefined) {
+      mEl.textContent = '-';
+      mEl.className = 'value';
+    } else {
+      const lv = ms.level;
+      mEl.textContent = fmt(r, 1) + '%';
+      mEl.className = 'value' + (lv === 'danger' ? ' alert-danger' : lv === 'warn' ? ' alert-warn' : '');
+    }
+  }
 }
 
 // ─── 构建 L1/L2 汇总行（列布局由 COL_DEF 驱动，与表头/L3 严格对齐）───────────
@@ -481,14 +636,31 @@ function buildAggRow(node, level, expSelf, collapsed, action) {
   const clsMap = { L1_PRODUCT: 'group-row', L2_MONTH: 'month-row', L3_LEG: 'pos-row' };
   const rowCls = clsMap[node.type] || 'group-row';
   tr.className = rowCls + (collapsed ? ' collapsed' : '');
+  // 告警变色：L1/L2 行取该行对应品种的最高级（danger > warn）
+  const _af2 = (State.snapshot && State.snapshot.active_flags) || {};
+  const _key2 = node.key || '';
+  let _lv2 = _af2[node.type === 'L1_PRODUCT' ? _key2 : undOf(_key2)];
+  if (_lv2 === 'danger') tr.classList.add('alert-danger');
+  else if (_lv2 === 'warn') tr.classList.add('alert-warn');
   const m = node.metrics || {};
   const ico = expSelf ? '▼' : '▶';
+  // 该行所属品种的单元格级标记：F 速率→标的价列，IV 速率→IV%列，Burn→当日盈亏列
+  const _ad2 = (State.snapshot && State.snapshot.active_details) || {};
+  const _und3 = node.type === 'L1_PRODUCT' ? _key2 : undOf(_key2);
+  const cellLv = (col) => {
+    if (col === 'underlying_price') return (_ad2.f_rate || {})[_und3];
+    if (col === 'iv')               return (_ad2.iv_rate || {})[_und3];
+    if (col === 'pnl_today')        return (_ad2.burn || {})[_und3];
+    return null;
+  };
   // symbol 列作为树控件格，其余列按 visible 过滤
   const dataCols = COL_DEF.filter(c => c.visible !== false && c.col !== 'symbol');
   const tds = dataCols.map(c => {
     if (c.col === 'symbol') return '';  // 不应出现
     // L1_PRODUCT 品种行不显示 volume（子节点汇总，无参考意义）
     if (node.type === 'L1_PRODUCT' && c.col === 'volume') return '<td></td>';
+    const aLv = cellLv(c.col);
+    const aCls = aLv === 'danger' ? 'alert-danger' : aLv === 'warn' ? 'alert-warn' : '';
     if (Object.prototype.hasOwnProperty.call(m, c.col)) {
       const v = m[c.col];
       const tag = c.col === 'deltacash' ? cls(tagDC(v))
@@ -496,9 +668,9 @@ function buildAggRow(node, level, expSelf, collapsed, action) {
                 : c.col.indexOf('pnl') === 0 ? pnlCls(v) : '';
       const defAlign = isNumCol(c.col) ? 'right' : 'left';
       const align = c.align ? `text-align:${c.align==='R'?'right':'left'};` : `text-align:${defAlign};`;
-      return `<td class="num ${tag}" style="${align}">${fmt(v, null, c.fmt, c.pct)}</td>`;
+      return `<td class="num ${tag} ${aCls}" style="${align}">${fmt(v, null, c.fmt, c.pct)}</td>`;
     }
-    return '<td></td>';
+    return aCls ? `<td class="${aCls}"></td>` : '<td></td>';
   });
   tr.innerHTML = `<td class="tree-cell"><span class="toggle" data-action="${action}" data-key="${node.key}">${ico}</span> <span class="l${level}-name">${node.name || node.key}</span></td>` + tds.join('');
   // 行头点击 → 折叠/展开
@@ -529,6 +701,14 @@ function buildL3Row(l3, l2Key) {
   tr.className = 'pos-row l3-indent';
   tr.dataset.key = l3.key;
 
+  // 告警标记：合约级（结构风险 |Δ|）→ 该合约整行；品种级四源 → 只标对应单元格
+  const _ad = (State.snapshot && State.snapshot.active_details) || {};
+  const _code = String(l3.symbol || '').split('.')[0];
+  const _und = undOf(_code);
+  const _lvRow = (_ad.conv_delta || {})[_code];
+  if (_lvRow === 'danger') tr.classList.add('alert-danger');
+  else if (_lvRow === 'warn') tr.classList.add('alert-warn');
+
   const visible = COL_DEF.filter(c => c.visible !== false);
   // L3 合约名（symbol）显示在树控件格，带缩进
   let html = `<td class="tree-cell"><span class="l3-sym">${l3.symbol}</span></td>`;
@@ -548,10 +728,16 @@ function buildL3Row(l3, l2Key) {
     const tagCls = getTagClass(c.col, l3);
     const pnlC   = c.col === 'pnl_history' ? pnlCls(l3.pnl_history)
                   : c.col === 'pnl_today'  ? pnlCls(l3.pnl_today) : '';
+    // 单元格级告警：F 速率→标的价列，IV 速率→IV%列，Burn→当日盈亏列
+    const aLv = c.col === 'underlying_price' ? (_ad.f_rate  || {})[_und]
+              : c.col === 'iv'               ? (_ad.iv_rate || {})[_und]
+              : c.col === 'pnl_today'        ? (_ad.burn    || {})[_und]
+              : null;
+    const aCls = aLv === 'danger' ? 'alert-danger' : aLv === 'warn' ? 'alert-warn' : '';
     // 数字列默认右对齐；文本列默认左对齐
     const defAlign = isNumCol(c.col) ? 'right' : 'left';
     const align = c.align ? `text-align:${c.align==='R'?'right':'left'};` : `text-align:${defAlign};`;
-    const cls    = [numCls, tagCls, pnlC].filter(Boolean).join(' ');
+    const cls    = [numCls, tagCls, pnlC, aCls].filter(Boolean).join(' ');
 
     html += `<td class="${cls}" style="${align}">${fmt(v, null, c.fmt, c.pct)}</td>`;
   }
@@ -662,18 +848,21 @@ async function loadRiskThresholds() {
   const el = document.getElementById('risk-thresholds');
   if (!el) return;
   try {
-    const res = await fetch('/api/alert/settings');
+    const res = await fetch('/api/alert/settings', {cache: 'no-store'});
     const data = await res.json();
     const cfg = data.settings || {};
     const spec = data.spec || {};
+    
+    // 品种净 Δ 监控仍禁用（后端 net_delta_warn=10000），故不出现在面板
+    const visibleKeys = ['f_rate_warn','f_rate_danger','iv_rate_warn','conv_delta_warn','burn_warn','burn_danger','margin_ratio_warn','margin_ratio_danger'];
+    
     let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;">';
-    for (const k of Object.keys(spec)) {
-      const label = spec[k].label || k;
+    for (const k of visibleKeys) {
+      const label = spec[k]?.label || k;
       const val = cfg[k] ?? null;
-      const lo = spec[k].lo, hi = spec[k].hi, step = spec[k].step || 0.01;
       const isNum = typeof val === 'number';
-      const unit = (k.includes('rate') || k.includes('burn')) ? '' : (k.includes('delta') ? '手' : '');
-      html += `<div class="field"><label>${label}</label><input type="${unit==='手'?'number':'text'}" id="th-${k}" value="${isNum?val:''}" placeholder="${Math.round((lo+hi)/2)}" ${unit?'min="'+lo+'" max="'+hi+'" step="'+step+'"':''}> <small>${unit||''}</small></div>`;
+      // 不加 min/max/step 限制，用户输入什么就存什么（后端同样不夹）
+      html += `<div class="field"><label>${label}</label><input type="${isNum?'number':'text'}" id="th-${k}" value="${isNum?val:''}"> </div>`;
     }
     html += '</div>';
     el.innerHTML = html;
@@ -682,7 +871,8 @@ async function loadRiskThresholds() {
 
 async function saveRiskThresholds() {
   const patch = {};
-  const keys = ['f_rate_warn','f_rate_danger','iv_rate_warn','net_delta_warn','burn_warn','burn_danger','margin_ratio_warn','margin_ratio_danger'];
+  // 品种净 Δ 监控仍禁用（后端 net_delta_warn=10000），故不提交
+  const keys = ['f_rate_warn','f_rate_danger','iv_rate_warn','conv_delta_warn','burn_warn','burn_danger','margin_ratio_warn','margin_ratio_danger'];
   for (const k of keys) {
     const inp = document.getElementById('th-'+k);
     if (inp && inp.value) {
@@ -693,7 +883,12 @@ async function saveRiskThresholds() {
   try {
     const res = await fetch('/api/alert/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(patch)});
     const ok = await res.json();
-    alert(ok.ok ? '已保存' : ('保存失败:'+JSON.stringify(ok)));
+    if (ok.ok) {
+      await loadRiskThresholds();   // 保存成功后立即重载，确保 UI 与后端一致
+      alert('阈值已保存');
+    } else {
+      alert('保存失败:'+JSON.stringify(ok));
+    }
   } catch(e) { alert(e.message); }
 }
 
@@ -735,11 +930,19 @@ function onSigmaRowChange(sym, val) {
 }
 
 async function saveSigmaRef() {
-  const tableRows = _sigma_table_rows.map(r => `${r.sym},${Math.round(r.sigma||0)}`).join('\n');
+  // 未填写的行写空值（占位），已填的写数字（百分比整数，后端自动 /100）
+  const tableRows = _sigma_table_rows.map(r => {
+    const v = (r.sigma == null || r.sigma <= 0) ? '' : Math.round(r.sigma);
+    return `${r.sym},${v}`;
+  }).join('\n');
   try {
     const res = await fetch('/api/sigma_ref/save', {method:'POST', headers:{'Content-Type':'text/plain'}, body:tableRows});
     const ok = await res.json();
-    alert(ok.ok ? '已落盘至 '+ok.csv_path : ('保存失败:'+JSON.stringify(ok)));
+    if (ok.ok) {
+      alert(`已保存 ${ok.rows_saved} 行 → ${ok.csv_path}`);
+    } else {
+      alert('保存失败: ' + (ok.error || JSON.stringify(ok)));
+    }
   } catch(e) { alert(e.message); }
 }
 

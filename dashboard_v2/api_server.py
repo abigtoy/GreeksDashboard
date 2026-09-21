@@ -13,7 +13,7 @@ import json
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from queue import Queue
 from typing import Optional
 
@@ -45,8 +45,8 @@ from vnpy.event import Event
 from vnpy.trader.constant import Direction, Offset, Product, Exchange
 from vnpy_engine import VNPYEngine
 from loguru import logger
-from dashboard_v2.risk_engine import build_tree, normalize_underlying
-from dashboard_v2.pricing import price_options_batch, days_to_expiry
+from dashboard_v2.risk_engine import build_tree, normalize_underlying, cp_from_symbol
+from dashboard_v2.pricing import price_options_batch, days_to_expiry, black76
 from dashboard_v2.settlement import SettlementManager, _valid_dates, _cutoff_date as _sm_cutoff, _scanned_dates as _sm_scanned
 from dashboard_v2.alert_config import load_alert_settings as _load_alerts, save_alert_settings as _save_alerts, get_threshold as _get_thresh
 from dashboard_v2.alert_config import load_sigma_ref as _load_sigma, sigma_ref_missing as _sigma_missing, append_sigma_symbols as _append_sigma
@@ -88,6 +88,16 @@ _shared_state = {
         {"col": "pnl_today",        "label": "当日盈亏",  "visible": True, "fmt": "0"},
         {"col": "pnl_history",      "label": "浮动盈亏",  "visible": True, "fmt": "0"},
     ],
+    # 监控预警状态（Ring buffer + 冷却计数 + 速率采样）
+    "alerts": [],                 # list[dict] 最多 100 条
+    "active_flags": {},           # {品种: "warn"|"danger"} 当前仍触发的聚合行
+    "active_details": {},         # {源: {键: "warn"|"danger"}} 单元格级标记（conv_delta 键=合约码）
+    "contract_und": {},           # {合约代码: 品种} 前端归一键（MO→IM 等别名）
+    "popups": [],                 # 待弹窗队列（累加不覆盖，前端按 alert_id|ts 去重）
+    "alert_state": {},            # {alert_id: {date, count, last_popup}}
+    "_f_samples": {},             # {und: deque([(ts, price), ...])} 标的价 5min 滚动窗口
+    "_iv_samples": {},            # {und: deque([(ts, iv), ...])} 5min 滚动窗口
+    "hours_missing": set(),       # 交易时段表查不到、已降级 4h 的品种
 }
 
 # ── CTP 连接参数（由 /api/ctp/connect 设置，Worker 启动时读取）────────────────
@@ -274,6 +284,13 @@ def _snapshot():
             "last_update": _shared_state["last_update"].strftime("%H:%M:%S") if _shared_state["last_update"] else "--:--:--",
             "worker_alive": _shared_state["worker_alive"],
             "uptime_seconds": int(time.time() - _SERVER_START),
+            "margin_status": _shared_state.get("margin_status", {}),
+            "hours_missing": sorted(_shared_state.get("hours_missing") or []),
+            "alerts": list(_shared_state.get("alerts", []))[-_ALERT_RING_MAX:],
+            "active_flags": dict(_shared_state.get("active_flags", {})),
+            "active_details": {k: dict(v) for k, v in (_shared_state.get("active_details") or {}).items()},
+            "contract_und": dict(_shared_state.get("contract_und", {})),
+            "popups": list(_shared_state.get("popups", []))[-_ALERT_RING_MAX:],
         }
 
 
@@ -1192,8 +1209,8 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         margin_headroom = None
         level = "unknown"
         if account_data:
-            m = get_threshold("margin_ratio_warn")
-            d = get_threshold("margin_ratio_danger")
+            m = _get_thresh("margin_ratio_warn")
+            d = _get_thresh("margin_ratio_danger")
             bal = account_data.get("balance", 0) or 0
             mg = account_data.get("margin", 0) or 0
             if bal > 0:
@@ -1211,6 +1228,31 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             "headroom": margin_headroom,
             "level": level,
         }
+
+    # ── 监控预警：四源触发检测（F 速率 / IV 速率 / Burn / Margin）──────────────────
+    try:
+        now_ts = time.time()
+        f_rate = _compute_f_rate(underlying_prices, now_ts)
+        iv_rate = _compute_iv_rate(by_underlying, option_greeks, now_ts)
+        burn = _compute_burn(positions_out, yesterday_snapshot)
+        structure = _compute_structure(positions_out)
+        # 合约代码 → 品种（前端所有变色/标记的统一键；MO→IM 等别名由 normalize_underlying 归一）
+        cund = {}
+        for p in positions_out:
+            code = (p.get("symbol") or "").split(".")[0]
+            if code:
+                cund[code] = normalize_underlying(code)
+        _shared_state["contract_und"] = cund
+        popups = _evaluate_alerts(f_rate, iv_rate, burn, structure, cund,
+                                  _shared_state.get("margin_status"), now_ts)
+        if popups:
+            # 累加不覆盖：popups 是瞬时事件，整体覆盖会让前端 3s 轮询扑空
+            buf = _shared_state.setdefault("popups", [])
+            buf.extend(popups)
+            del buf[: -_ALERT_RING_MAX]
+    except Exception:
+        import traceback
+        logger.warning(f"[alert] 触发检测异常: {traceback.format_exc()}")
 
 
 # ── Flask Blueprint ──────────────────────────────────────────────────────────
@@ -1595,6 +1637,380 @@ def api_snapshot_load():
     })
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 监控预警引擎（四源：F 速率 / ATM IV 速率 / Premium Burn / Margin）
+#   设计见 监控预警_后端实现设计_v0.2.md
+#   原则：只复用 _poll_once 已拿到的数据，不新增定时任务，不落盘
+# ══════════════════════════════════════════════════════════════════════════
+
+_ALERT_COOLDOWN = {"warn": 600, "danger": 300}   # 冷却（秒）：黄10min 红5min
+_ALERT_DAILY_MAX = 3                             # 同一告警当日弹窗上限
+_ALERT_RING_MAX = 100                            # 历史 ring buffer 上限
+_IV_WINDOW_SEC = 300                             # IV 滚动窗口 5min
+_IV_GAP_SEC = 4 * 3600                           # IV 样本间隔 > 4h → 断档清空
+_F_RATE_ANNUAL_DAYS = 250                        # 口径：1年 = 250 交易日
+_F_HOURS_FALLBACK = 4.0                          # trading_hours.csv 查不到时的降级时长(h)
+
+
+def _level_of(value, warn, danger):
+    """值与阈值比较 → 'danger' | 'warn' | None"""
+    if value is None:
+        return None
+    if danger is not None and value >= danger:
+        return "danger"
+    if warn is not None and value >= warn:
+        return "warn"
+    return None
+
+
+def _sigma_of(und):
+    """品种 σ_ref（正常行情下的 IV 上限），缺失/非法 → 0.25。"""
+    try:
+        from dashboard_v2.alert_config import get_sigma
+        sigma, _ = get_sigma(und)
+    except Exception:
+        sigma = None
+    return sigma if (sigma and sigma > 0) else 0.25
+
+
+def _hours_of(und):
+    """
+    品种日交易总时长（小时），查 config/trading_hours.csv。
+    查不到 → 降级 4h，并「跳出提醒」：logger 警告一次 + hours_missing 随看板下发。
+    """
+    try:
+        from dashboard_v2.alert_config import get_trading_hours
+        row = get_trading_hours(und)
+    except Exception:
+        row = None
+    if row and row.get("hours", 0) > 0:
+        return row["hours"]
+    missing = _shared_state.setdefault("hours_missing", set())
+    if und not in missing:
+        missing.add(und)
+        logger.warning(
+            f"[交易时段] 品种 {und} 不在 config/trading_hours.csv，"
+            f"本次降级按 {_F_HOURS_FALLBACK}h 计算（请补表）"
+        )
+    return _F_HOURS_FALLBACK
+
+
+def _conv_delta(symbol, F, K, days):
+    """
+    「换算Δ」= 固定 σ_ref 下、按该合约**自身剩余到期**算出的 Black-76 Δ（带符号）。
+    与市场 Δ 的区别：市场 Δ 随 IV 漂移，换算Δ 只随 F/K/T 变，口径稳定，
+    用于「行权价离标的有多远」的判定（平值腿选择、结构告警）。
+    看板 Δ 列仍显示市场 Δ（列名就叫「Δ」）。
+    缺 F/K/到期 → None。
+    """
+    if not F or F <= 0 or not K or K <= 0 or not days or days <= 0:
+        return None
+    und = normalize_underlying((symbol or "").split(".")[0])
+    try:
+        g = black76(_sigma_of(und), F, K, days / 365.0, cp=cp_from_symbol(symbol))
+        d = g.get("delta")
+    except Exception:
+        return None
+    return d if (d is not None and d == d) else None
+
+
+def _compute_f_rate(underlying_prices, now_ts):
+    """
+    品种级 F 速率 = ln(5min窗口内标的最高/最低) / (σ_ref × √(5min/年))。
+    分母 √ 内 = 5min / (250交易日 × 60min × 日交易总时长h)，即「5min 占一年的比例」。
+    采样仍是秒级；5min 只是观测窗口，窗口规则与 IV 速率一致（相邻样本间隔 >4h 断档清空）。
+    返回 {und: (rate, 窗口最低价, 窗口最高价)}。
+    """
+    import math
+    samples = _shared_state.setdefault("_f_samples", {})
+    out = {}
+    for full_und, price in (underlying_prices or {}).items():
+        sym = full_und.split(".")[0]
+        und = normalize_underlying(sym)
+        if not price or price <= 0:
+            continue
+        dq = samples.get(und)
+        if dq is None:
+            dq = samples[und] = deque()
+        if dq and (now_ts - dq[-1][0]) > _IV_GAP_SEC:
+            dq.clear()
+        dq.append((now_ts, price))
+        while dq and (now_ts - dq[0][0]) > _IV_WINDOW_SEC:
+            dq.popleft()
+        if len(dq) < 2:
+            continue
+        lo = min(v for _, v in dq)
+        hi = max(v for _, v in dq)
+        if lo <= 0 or hi <= lo:
+            continue
+        scale = _sigma_of(und) * math.sqrt(
+            5.0 / (_F_RATE_ANNUAL_DAYS * 60.0 * _hours_of(und))
+        )
+        if scale <= 0:
+            continue
+        # (速率, 窗口最低, 窗口最高) —— 两端值与告警值严格一致
+        out[und] = (math.log(hi / lo) / scale, lo, hi)
+    return out
+
+
+def _atm_iv_of_group(pos_list, option_greeks):
+    """
+    取一组（同 underlying+expiry）的 ATM IV：
+    最接近 |Δ|=0.5 且非 ITM 的合约，多候选取中位数。
+    选腿用「换算Δ」（固定 σ_ref，不随市场 IV 漂移）；观测的 IV 仍是市场 IV。
+    """
+    cands = []
+    for pos, contract in pos_list:
+        g = option_greeks.get(pos.vt_symbol)
+        if not g:
+            continue
+        iv = g.get("iv")
+        if iv is None or iv <= 0:
+            continue
+        d = _conv_delta(pos.vt_symbol, g.get("underlying_price"), g.get("strike"), g.get("days_to_expiry"))
+        if d is None:
+            d = g.get("delta") or 0        # 换算Δ 算不出（缺 K/到期）→ 退回市场 Δ
+        d = abs(d)
+        itm = bool(g.get("is_itm"))
+        cands.append((d, itm, iv))
+    if not cands:
+        return None
+    # 非 ITM 优先
+    non_itm = [c for c in cands if not c[1]] or cands
+    non_itm.sort(key=lambda c: abs(c[0] - 0.5))
+    top = non_itm[: min(3, len(non_itm))]
+    ivs = sorted(c[2] for c in top)
+    n = len(ivs)
+    return ivs[n // 2] if n % 2 == 1 else (ivs[n // 2 - 1] + ivs[n // 2]) / 2.0
+
+
+def _compute_iv_rate(by_underlying, option_greeks, now_ts):
+    """
+    品种级 ATM IV 速率 = (5min窗口 IV 极差) / σ_ref，5min 滚动窗口。
+    单位 = **百分数**（值 5.0 即 5%，即极差占 σ_ref 的 5%）；与阈值 iv_rate_warn 同量纲，直接比。
+    断档规则：相邻样本间隔 > 4h → 清空窗口重计。
+    返回 {und: (rate, 窗口低点, 窗口高点)}，低/高点为 IV 原值（vol 点）。
+    """
+    # 1. 汇总每个品种当前 ATM IV（同品种按月分组，取样本最多的月）
+    per_und = defaultdict(dict)   # {und: {expiry: iv}}
+    for (und_raw, expiry), pos_list in (by_underlying or {}).items():
+        und = normalize_underlying(und_raw) if und_raw else ""
+        if not und:
+            continue
+        iv = _atm_iv_of_group(pos_list, option_greeks)
+        if iv is not None:
+            per_und[und][expiry] = iv
+
+    samples = _shared_state.setdefault("_iv_samples", {})
+    out = {}
+    for und, by_exp in per_und.items():
+        ivs = sorted(by_exp.values())
+        n = len(ivs)
+        iv_now = ivs[n // 2] if n % 2 == 1 else (ivs[n // 2 - 1] + ivs[n // 2]) / 2.0
+        dq = samples.get(und)
+        if dq is None:
+            dq = deque()
+            samples[und] = dq
+        # 断档检测：与上一样本间隔 > 4h → 清空
+        if dq and (now_ts - dq[-1][0]) > _IV_GAP_SEC:
+            dq.clear()
+        dq.append((now_ts, iv_now))
+        # 剔除 >5min 的过期样本
+        while dq and (now_ts - dq[0][0]) > _IV_WINDOW_SEC:
+            dq.popleft()
+        # 5min 窗口 H/L（采样仍是秒级）
+        if len(dq) >= 2:
+            vals = [v for _, v in dq]
+            lo, hi = min(vals), max(vals)
+            if lo > 0:
+                # 口径：5min IV 极差占 σ_ref 的比例，用百分数表示（值 5.0 = 5%）
+                #   iv 是百分数、σ_ref 是小数 → (hi-lo)/(σ_ref×100) 是无量纲比，(hi-lo)/σ_ref 即百分号上的数字
+                out[und] = ((hi - lo) / _sigma_of(und), lo, hi)
+    return out
+
+
+def _compute_burn(positions_out, yesterday_snapshot):
+    """
+    品种级 Premium Burn = 今日净浮亏 / |昨日卖方净收权利金|。
+    昨日卖方净权利金 ≤0 → 该品种跳过。
+    返回 {und: burn}。
+    """
+    agg = defaultdict(lambda: {"loss": 0.0, "premium": 0.0})
+    for p in positions_out or []:
+        # 期权才有 option_type（期货为 ""；CTP 值是中文 '看涨期权'/'看跌期权'，不能按 C/P 判）
+        if not p.get("option_type"):
+            continue
+        und = normalize_underlying(p.get("symbol", "").split(".")[0])
+        if not und:
+            continue
+        dir_sign = 1.0 if p.get("direction") == "short" else -1.0
+        vol = abs(p.get("volume") or 0)
+        size = p.get("size") or 1
+        cur = p.get("adjust_price") or p.get("last_price") or 0
+        # 昨收价：快照 adjust_price
+        snap = yesterday_snapshot.get(f"{p.get('symbol')}_{p.get('direction')}")
+        prev = None
+        if isinstance(snap, dict):
+            prev = snap.get("adjust_price")
+        elif isinstance(snap, (int, float)):
+            prev = snap
+        if prev is None or prev <= 0 or cur <= 0:
+            continue
+        # 卖方的权利金收入（正）
+        if dir_sign > 0:
+            agg[und]["premium"] += prev * vol * size
+        # 今日浮亏（对卖方：昨收 − 现价；对买方：现价 − 昨收）
+        pnl = (prev - cur) * vol * size * dir_sign
+        if pnl < 0:
+            agg[und]["loss"] += -pnl
+    out = {}
+    for und, a in agg.items():
+        prem = a["premium"]
+        if prem and prem > 0:
+            out[und] = a["loss"] / prem
+    return out
+
+
+def _compute_structure(positions_out):
+    """
+    合约级结构风险（设计稿 v0.2 §五·③）：
+      逐腿 |换算Δ| ≥ Y → 黄；该腿已越界实值（K 与 F 异侧）→ 红。
+      换算Δ = 固定 σ_ref 下的 Δ（口径稳定，不随市场 IV 漂移）；看板 Δ 列仍显示市场 Δ。
+      档距（左右两档行权价之差）仅作展示字段，不参与触发。
+    返回 {合约代码: (level, |换算Δ|, Y)}。
+    """
+    y = _get_thresh("conv_delta_warn")
+    if not y or y <= 0:
+        return {}
+    out = {}
+    for p in positions_out or []:
+        # 期权才有 option_type（期货为 ""；CTP 值是中文 '看涨期权'/'看跌期权'，不能按 C/P 判）
+        if not p.get("option_type"):
+            continue
+        code = (p.get("symbol") or "").split(".")[0]
+        if not code:
+            continue
+        if abs(p.get("volume") or 0) <= 0:
+            continue
+        d = _conv_delta(p.get("symbol"), p.get("underlying_price"),
+                        p.get("strike"), p.get("days_to_expiry"))
+        if d is None:
+            continue
+        d = abs(d)
+        if d < y:
+            continue
+        out[code] = ("danger" if p.get("is_itm") else "warn", round(d, 4), y)
+    return out
+
+
+def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_status, now_ts):
+    """
+    汇总五源 → 判级 → 冷却/计数 → 写 alerts / active_flags / active_details / popups。
+    返回本轮应弹窗的 popups 列表。
+    """
+    today = datetime.datetime.fromtimestamp(now_ts).strftime("%Y%m%d")
+    events = []   # (source, symbol, value, level, threshold)
+    pts = {}      # (source, symbol) -> (起点值, 报警时值)，仅移动量类告警有
+    def _push(source, symbol, value, warn_k, danger_k):
+        w = _get_thresh(warn_k)
+        d = _get_thresh(danger_k) if danger_k else None
+        lv = _level_of(value, w, d)
+        if lv:
+            thr = d if lv == "danger" else w
+            events.append((source, symbol, value, lv, thr))
+
+    # F / IV 速率是移动量：连同"从多少到多少"的两端一起上报
+    for und, (rate, p0, p1) in (f_rate or {}).items():
+        _push("f_rate", und, rate, "f_rate_warn", "f_rate_danger")
+        pts[("f_rate", und)] = (p0, p1)
+    for und, (rate, p0, p1) in (iv_rate or {}).items():
+        _push("iv_rate", und, rate, "iv_rate_warn", None)
+        pts[("iv_rate", und)] = (p0, p1)
+    for und, v in (burn or {}).items():
+        _push("burn", und, v, "burn_warn", "burn_danger")
+    # 结构风险：级别由「是否实值」定，不比较阈值（红=已越界实值）
+    # 源键用 conv_delta（换算Δ），与看板的市场 Δ 列区分开
+    for code, (lv, v, thr) in (structure or {}).items():
+        events.append(("conv_delta", code, v, lv, thr))
+    if margin_status and margin_status.get("level") in ("warn", "danger"):
+        lv = margin_status["level"]
+        thr = _get_thresh("margin_ratio_danger" if lv == "danger" else "margin_ratio_warn")
+        events.append(("margin", "ACCOUNT", margin_status.get("ratio_pct"), lv, thr))
+
+    # 当前仍触发的标记：active_flags 按品种聚合（行变色），active_details 按源分列（单元格标记）
+    active = {}
+    details = {}
+    def _bump(und, lv):
+        if not und:
+            return
+        prev = active.get(und)
+        if prev == "danger":
+            return
+        active[und] = "danger" if lv == "danger" else (prev or "warn")
+
+    und_of = {}
+    for source, symbol, value, lv, thr in events:
+        und = (contract_und or {}).get(symbol) if source == "conv_delta" else symbol
+        und = und or normalize_underlying(symbol)
+        und_of[(source, symbol)] = und
+        details.setdefault(source, {})[symbol] = lv
+        _bump(und, lv)
+    _shared_state["active_flags"] = active
+    _shared_state["active_details"] = details
+
+    # 冷却 + 计数 → 决定是否弹窗 + 写历史
+    state = _shared_state.setdefault("alert_state", {})
+    prev_active = _shared_state.setdefault("prev_active", {})
+    hist = _shared_state.setdefault("alerts", [])
+    popups = []
+    cur_active = {}
+    for source, symbol, value, lv, thr in events:
+        key = f"{source}|{symbol}"
+        cur_active[key] = lv
+        # 只在状态跳变（新出现 / 级别变化）时记录+弹窗，持续触发不重复刷屏
+        if prev_active.get(key) == lv:
+            continue
+        alert_id = f"{source}|{symbol}|{lv}"
+        st = state.setdefault(alert_id, {})
+        if st.get("date") != today:
+            st.update(date=today, count=0, last_popup=0.0)
+        should = False
+        if st["count"] < _ALERT_DAILY_MAX:
+            cd = _ALERT_COOLDOWN.get(lv, 600)
+            if now_ts - st.get("last_popup", 0.0) >= cd:
+                st["count"] += 1
+                st["last_popup"] = now_ts
+                should = True
+        und = und_of.get((source, symbol)) or symbol
+        p0, p1 = pts.get((source, symbol), (None, None))
+        tail = f"（{p0:.4g} → {p1:.4g}）" if p0 is not None and p1 is not None else ""
+        if source == "conv_delta":
+            msg = (f"换算Δ·红 {und} {symbol} |Δ|={value:.4g} 已越界实值" if lv == "danger"
+                   else f"换算Δ·黄 {und} {symbol} |Δ|={value:.4g} ≥ {thr:.4g}")
+        elif source == "margin":
+            msg = f"保证金·{'红' if lv == 'danger' else '黄'} 风险度 {value:.4g}% ≥ {thr:.4g}%"
+        else:
+            # 移动量类带单位：F 速率是倍数，IV 速率是百分数（阈值框里填的就是这个数）
+            unit = {"f_rate": "倍", "iv_rate": "%"}.get(source, "")
+            msg = f"{source}·{'红' if lv == 'danger' else '黄'} {und} {value:.4g}{unit} ≥ {thr:.4g}{unit}{tail}"
+        rec = {
+            "alert_id": alert_id,
+            "ts": datetime.datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source, "level": lv, "symbol": symbol, "underlying": und,
+            "value": round(value, 6) if isinstance(value, float) else value,
+            "v_from": round(p0, 6) if isinstance(p0, float) else p0,
+            "v_to": round(p1, 6) if isinstance(p1, float) else p1,
+            "threshold": thr, "msg": msg, "popup": should,
+        }
+        hist.append(rec)
+        if should:
+            popups.append(rec)
+    _shared_state["prev_active"] = cur_active
+    if len(hist) > _ALERT_RING_MAX:
+        del hist[: len(hist) - _ALERT_RING_MAX]
+    return popups
+
+
 @api_bp.route("/dashboard", methods=["GET"])
 def api_dashboard():
     """返回完整看板快照（持仓树 + Greeks + 账户 + CTP状态）"""
@@ -1612,8 +2028,21 @@ def api_dashboard():
         "worker_alive": snap["worker_alive"],
         "settlement_dict": snap["settlement_dict"],
         "settlement_prices": snap["settlement_prices"],
+        "margin_status": snap.get("margin_status", {}),
+        "hours_missing": sorted(snap.get("hours_missing") or []),
+        "alerts": _alerts_today(snap.get("alerts", [])),
+        "active_flags": snap.get("active_flags", {}),
+        "active_details": snap.get("active_details", {}),
+        "contract_und": snap.get("contract_und", {}),
+        "popups": snap.get("popups", []),
     }
     return jsonify(_clean_nan(payload))
+
+
+def _alerts_today(alerts):
+    """告警历史只回当天（跨自然日自动清空，与弹窗计数口径一致）。"""
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    return [a for a in (alerts or []) if str(a.get("ts", "")).startswith(today)]
 
 
 @api_bp.route("/ctp/connect", methods=["POST"])
@@ -1625,11 +2054,31 @@ def api_ctp_connect():
     global _worker_thread
 
     data = request.get_json() or {}
-    # 7 个中文键均为用户填写、不可为空
+    # 7 个中文键均为用户填写、不可为空；前端没传时自动回退已保存配置
     required = ["用户名", "密码", "经纪商代码", "交易服务器", "行情服务器", "产品名称", "授权编码"]
     missing = [k for k in required if not (data.get(k) or "").strip()]
     if missing:
-        return jsonify({"success": False, "error": "以下字段不可为空: " + "、".join(missing)}), 400
+        # 回退：内存 _ctp_credential
+        fb = dict(_ctp_credential)
+        still_missing = [k for k in missing if not (fb.get(k) or "").strip()]
+        if not still_missing:
+            data = fb
+        else:
+            # 再回退：ctp_accounts.json active 账户
+            try:
+                acct = _load_accounts()
+                active = acct.get("active", "") or "默认"
+                fb2 = acct.get("accounts", {}).get(active, {})
+                still_missing2 = [k for k in still_missing if not (fb2.get(k) or "").strip()]
+                if not still_missing2:
+                    data = fb2
+                    _ctp_credential.clear()
+                    _ctp_credential.update(fb2)
+            except Exception:
+                pass
+        missing = [k for k in required if not (data.get(k) or "").strip()]
+        if missing:
+            return jsonify({"success": False, "error": "以下字段不可为空: " + "、".join(missing)}), 400
 
     # 保存凭证（中文键，直接作为 VNPYEngine.ctp_setting）
     _ctp_credential.clear()
@@ -1780,6 +2229,11 @@ def api_diag():
                 # 再次检查 gateway.positions 原始内容
                 if hasattr(gw, "positions") and gw.positions:
                     out["td_gateway_positions_after"] = {k: {"vol": v.volume, "dir": str(v.direction), "symbol": v.symbol} for k, v in gw.positions.items()}
+    # 监控预警内部状态（排查弹窗用）
+    out["alert_state"] = {k: dict(v) for k, v in _shared_state.get("alert_state", {}).items()}
+    out["popups_current"] = len(_shared_state.get("popups", []))
+    out["active_flags"] = dict(_shared_state.get("active_flags", {}))
+    out["alert_rings"] = len(_shared_state.get("alerts", []))
     return jsonify(out)
 
 
@@ -1974,33 +2428,43 @@ def create_app(settlement_dir: str = "结算单", static_folder=None, template_f
     def _save_sigma_ref_csv():
         """用户从前端面板手动提交 CSV 内容（纯文本保存）。"""
         raw = request.data.decode('utf-8')
-        lines = [l.strip() for l in raw.split('\\n') if l.strip() and not l.strip().startswith('#')]
+        lines = [l.strip() for l in raw.split('\n') if l.strip() and not l.strip().startswith('#')]
         if not lines:
             return jsonify({"error": "empty content"}), 400
         try:
-            import csv
             import os as _os
             from dashboard_v2.alert_config import CONFIG_DIR
             path = _os.path.join(CONFIG_DIR, "iv_sigma_ref.csv")
             _os.makedirs(CONFIG_DIR, exist_ok=True)
+            saved = 0
             with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+                f.write("symbol,sigma_ref\n")
                 for line in lines:
                     # parse CSV row -> normalize symbol -> clamp sigma
                     parts = [p.strip() for p in line.split(',')]
                     if len(parts) < 2:
                         continue
                     sym = parts[0].strip().upper()
-                    sigma_val = float(parts[1].strip())
+                    raw_val = parts[1].strip()
+                    if not raw_val:
+                        continue          # 空值 = 占位行，跳过（不写 0）
+                    try:
+                        sigma_val = float(raw_val)
+                    except ValueError:
+                        continue          # 非数字跳过，不吞掉整批
+                    if sigma_val <= 0:
+                        continue          # 0 或负数视为未填
                     if sigma_val > 1.5:
                         sigma_val = sigma_val / 100.0
                     if not (0.02 <= sigma_val <= 1.50):
                         continue
-                    f.write(f"{sym},{sigma_val:.4f}\\n")
+                    f.write(f"{sym},{sigma_val:.4f}\n")
+                    saved += 1
             from dashboard_v2.alert_config import load_sigma_ref
             load_sigma_ref(force=True)
-            return jsonify({"ok": True, "csv_path": path, "rows_saved": len(lines)})
+            return jsonify({"ok": True, "csv_path": path, "rows_saved": saved})
         except Exception as e:
-            import traceback
+            logger.error(f"[/api/sigma_ref/save] 落盘失败: {e}")
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/debug/pos")
