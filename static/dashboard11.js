@@ -50,41 +50,65 @@ let COL_DEF = [
   { col: 'pnl_history',      label: '浮动盈亏',  fmt: '0',     align: 'R' },
 ];
 
-// 异步加载列配置：优先 localStorage（需完整18列），其次 API
+// 加载列配置：服务器优先（唯一权威），localStorage 仅离线兜底镜像
 async function loadColConfig() {
-  const local = localStorage.getItem('col_config');
-  if (local) {
-    try {
-      const parsed = JSON.parse(local);
-      // 验证完整性：至少14列以上才算有效配置
-      if (Array.isArray(parsed) && parsed.length >= 14) {
-        COL_DEF = parsed.filter(c => c.col !== 'direction');   // 方向不显示，持仓量符号已含多空
-        return;
-      }
-    } catch (_) {}
-  }
   try {
     const r = await fetch_json('/api/columns');
     if (r && r.columns && Array.isArray(r.columns) && r.columns.length >= 14) {
       COL_DEF = r.columns.filter(c => c.col !== 'direction');
       localStorage.setItem('col_config', JSON.stringify(COL_DEF));
+      return;
     }
   } catch (_) {}
+  const local = localStorage.getItem('col_config');
+  if (local) {
+    try {
+      const parsed = JSON.parse(local);
+      if (Array.isArray(parsed) && parsed.length >= 14) {
+        COL_DEF = parsed.filter(c => c.col !== 'direction');
+      }
+    } catch (_) {}
+  }
 }
 
-// 保存列配置到 API + localStorage
+// 保存列配置：服务器权威（失败重试一次），localStorage 仅做离线镜像
 async function saveColConfig() {
-  try {
-    await fetch('/api/columns', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ columns: COL_DEF }),
-    });
-  } catch (_) {}
+  const body = JSON.stringify({ columns: COL_DEF });
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await fetch('/api/columns', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      if (r.ok) break;
+    } catch (_) {}
+  }
   localStorage.setItem('col_config', JSON.stringify(COL_DEF));
 }
 
 // 表头由 COL_DEF 生成，首列为树控件列
+// ===== 页面边距（09-24规格）=====
+// 左右：字段能完整展示 → max(5%视口宽, 20px)；有横向溢出（不完整）→ 20px。下：表格区固定20px
+// 三个块统一边距（整体左右对齐）：.header 信息栏、.summary-bar 概览、.wrap 持仓表
+// 注：.wrap 未设 overflow-x，宽内容会 visible 穿透，wrap.scrollWidth 测不到——
+//     须用表格自身 offsetWidth 与 wrap.clientWidth 比较
+function applyTableMargin() {
+  const wrap = document.querySelector('.wrap');
+  if (!wrap) return;
+  const tbl = wrap.querySelector('table');
+  wrap.style.marginBottom = '20px';
+  const big = Math.max(window.innerWidth * 0.05, 20);
+  let m = big;
+  wrap.style.marginLeft = wrap.style.marginRight = big + 'px';   // 先按大边距撑开再测
+  if (tbl && tbl.offsetWidth - wrap.clientWidth > 1) m = 20;      // 字段不完整 → 回退20px
+  const px = m + 'px';
+  wrap.style.marginLeft = wrap.style.marginRight = px;
+  document.querySelectorAll('.header, .summary-bar').forEach(el => {
+    el.style.marginLeft = el.style.marginRight = px;
+  });
+}
+
 function renderHead() {
   const tr = document.getElementById('headRow');
   if (!tr) return;
@@ -96,6 +120,24 @@ function renderHead() {
   tr.querySelectorAll('[data-sort-col]').forEach(el =>
     el.addEventListener('click', () => sortBy(el.dataset.sortCol)));
   updateHeadSortCls();
+  renderFoot(visible);
+  applyTableMargin();
+}
+
+// 表尾汇总行：与表头列对齐。合约列写"汇总"；数量/ΔCash/ΓCash/VegaCash/ΘCash/当日盈亏/浮动盈亏 各占对应列，其余列留空
+function renderFoot(visible) {
+  const foot = document.getElementById('sumFoot');
+  if (!foot) return;
+  const ids = { volume: 'ftVol', deltacash: 'ftDC', gammacash: 'ftGC',
+                vegacash: 'ftVC', thetacash: 'ftTC', pnl_today: 'ftPnlT', pnl_history: 'ftPnlH' };
+  foot.innerHTML = '<tr style="font-weight: bold; position: sticky; bottom: 0; background: #1a1a1a; border-top: 2px solid #555;">'
+    + '<td>汇总</td>'
+    + visible.map(c => {
+        const align = c.align === 'L' ? 'left' : 'right';
+        const id = ids[c.col];
+        return `<td ${id ? `id="${id}"` : ''} style="text-align:${align}">-</td>`;
+      }).join('')
+    + '</tr>';
 }
 
 function updateHeadSortCls() {
@@ -453,11 +495,12 @@ function renderAlertList() {
   tbody.innerHTML = rows.map(a => {
     const lvCls = a.level === 'danger' ? 'ah-lv-danger' : 'ah-lv-warn';
     const lvTxt = a.level === 'danger' ? '红' : '黄';
+    const f2 = v => (v === null || v === undefined || v === '') ? '' : Number(v).toFixed(2);
     const span = (a.v_from === null || a.v_from === undefined) ? '' : `${a.v_from} → ${a.v_to}`;
     return `<tr><td>${a.ts ? a.ts.slice(11) : ''}</td><td>${SRC_LABEL[a.source] || a.source || ''}</td>`
          + `<td>${a.underlying || a.symbol || ''}</td><td>${a.symbol || ''}</td>`
-         + `<td class="${lvCls}">${lvTxt}</td><td>${a.value ?? ''}</td><td>${span}</td>`
-         + `<td>${a.threshold ?? ''}</td></tr>`;
+         + `<td class="${lvCls}">${lvTxt}</td><td>${f2(a.value)}</td><td>${span}</td>`
+         + `<td>${f2(a.threshold)}</td></tr>`;
   }).join('');
 }
 
@@ -518,6 +561,7 @@ function render() {
 
   // Summary 区
   renderSummary(snap.summary);
+  applyTableMargin();
 }
 
 // ─── 树过滤 ──────────────────────────────────────────────────────────────────
@@ -597,22 +641,45 @@ function renderSummary(s) {
     const el = document.getElementById(id);
     if (el) el.textContent = fmt(v, dec);
   };
-  set('sumDC',    s.total_deltacash,   0);
-  set('sumGC',    s.total_gammacash,   0);
-  set('sumVC',    s.total_vegacash,    0);
-  set('sumTC',    s.total_thetacash,   0);
-  set('sumPnlT',  s.total_pnl_today,   0);
-  set('sumPnlH',  s.total_pnl_history, 0);
-  set('posCount', s.tree ? s.tree.reduce((n, l1) => n + l1.children.reduce((m, l2) => m + (l2.children || []).length, 0), 0) : 0, 0);
+  // Greeks 汇总 + 数量：持仓表表尾汇总行（renderFoot 生成 ft* 单元格，列被隐藏时 set 容错跳过）
+  set('ftDC', s.total_deltacash,   0);
+  set('ftGC', s.total_gammacash,   0);
+  set('ftVC', s.total_vegacash,    0);
+  set('ftTC', s.total_thetacash,   0);
+  // 汇总行"数量"= 全部持仓手数
+  const posAll = (State.snapshot && State.snapshot.positions) || [];
+  set('ftVol', posAll.reduce((a, p) => a + Math.abs(p.volume || 0), 0), 0);
 
-  // Summary 行颜色
-  const pnlH = parseFloat(s.total_pnl_history) || 0;
-  const el = document.getElementById('sumPnlH');
-  if (el) {
-    el.className = pnlCls(pnlH);
-    el.textContent = fmt(pnlH, 0);
+  // 市值权益 = 动态权益(CTP balance) + 期权净市值（多头为正、空头为负，义务仓当负债）
+  // 已对券商验证：6928813.19 + 79480(多头) - 442580(空头) = 6565713.19 ✓
+  let netOptMv = 0;
+  const posList = (State.snapshot && State.snapshot.positions) || [];
+  for (const p of posList) {
+    if (!p.option_type) continue; // 期货 option_type 为空
+    const mv = (p.last_price || 0) * Math.abs(p.volume || 0) * (p.size || 0);
+    netOptMv += p.direction === 'long' ? mv : -mv;
   }
+  set('sumEquity',
+      (State.snapshot && State.snapshot.account ? State.snapshot.account.balance : null) !== null
+        ? (State.snapshot.account.balance + netOptMv)
+        : null,
+      0);
 
+  set('ftPnlT',  s.total_pnl_today,   0);
+  set('ftPnlH',  s.total_pnl_history, 0);
+  set('sumPnlT', s.total_pnl_today,   0);
+  set('sumPnlH', s.total_pnl_history, 0);
+  // 盈亏国际标准配色：盈利绿 #4ade80 / 亏损红 #f87171 / 零默认白
+  const setSign = (id, v) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.style.color = v > 0 ? '#4ade80' : v < 0 ? '#f87171' : '';
+  };
+  setSign('sumPnlT', s.total_pnl_today);
+  setSign('sumPnlH', s.total_pnl_history);
+  setSign('ftPnlT', s.total_pnl_today);
+  setSign('ftPnlH', s.total_pnl_history);
+  // 浮动盈亏/持仓数已从概览移除，此处仅保留风险度
   // 风险度（账户级 Margin：黄 95% / 红 110%，仅提示不阻断）
   const ms = (State.snapshot && State.snapshot.margin_status) || {};
   const mEl = document.getElementById('sumMargin');
@@ -625,6 +692,18 @@ function renderSummary(s) {
       const lv = ms.level;
       mEl.textContent = fmt(r, 1) + '%';
       mEl.className = 'value' + (lv === 'danger' ? ' alert-danger' : lv === 'warn' ? ' alert-warn' : '');
+    }
+  }
+  // 标准风险度 = margin / equity（ms.ratio_pct）
+  // 严格风险度 = (margin + obligation_premium) / equity × 100（后端直接算好传 ms.strict_risk_ratio）
+  const strictEl = document.getElementById('sumMarginStrict');
+  if (strictEl) {
+    if (ms && ms.strict_risk_ratio !== null && ms.strict_risk_ratio !== undefined) {
+      strictEl.textContent = fmt(ms.strict_risk_ratio, 1) + '%';
+      strictEl.className = 'value' + (ms.strict_risk_ratio >= 95 ? ' alert-danger' : ms.strict_risk_ratio >= 85 ? ' alert-warn' : '');
+    } else {
+      strictEl.textContent = '-';
+      strictEl.className = 'value';
     }
   }
 }
@@ -1133,7 +1212,7 @@ function returnToLive() {
 async function init() {
   State.startTime = Date.now();
 
-  // 加载列配置（优先 localStorage，其次 API）
+  // 加载列配置（服务器优先，本地仅兜底）
   await loadColConfig();
 
   // 列头点击排序

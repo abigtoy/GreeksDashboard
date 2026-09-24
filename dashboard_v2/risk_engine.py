@@ -144,6 +144,24 @@ def calc_adjust_price(tick: dict, contract: dict) -> float:
 # =======================================================================
 # 3.4 calc_greeks（兼容期货与期权）
 # =======================================================================
+# 中金所股指系：期货乘数 300/200，期权乘数 100 —— 同一列里 Δ 不可比。
+# 归一：delta_norm = delta × (size/100)。期货腿 ×3/×2，期权腿 ×1 不变，
+# 全列统一到"100 元/点"口径（文华习惯）。仅股指系生效，商品品种一律 ×1。
+# 注意：deltacash 始终用原始 pos_delta×F×size 计算，与本归一无关（不受影响）。
+_IDX_CFFEX = {'IF', 'IH', 'IC', 'IM', 'IO', 'HO', 'MO'}
+
+def _idx_norm_factor(symbol, size) -> float:
+    s = str(symbol or '').split('.')[0].upper()
+    prod = s[:2]
+    if prod in _IDX_CFFEX:
+        try:
+            f = float(size) / 100.0
+            return f if f > 0 else 1.0
+        except (TypeError, ValueError):
+            return 1.0
+    return 1.0
+
+
 def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
     """
     计算持仓 Greeks + Cash Greeks。
@@ -165,6 +183,7 @@ def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
         return {
             # 可汇总列一律头寸级（原始×方向×手数）；父级直接 Σ 子级
             "delta": pos_delta, "gamma": 0.0, "vega": 0.0, "theta": 0.0,
+            "delta_norm": pos_delta * _idx_norm_factor(position['symbol'], size),
             "pos_delta": pos_delta,
             "pos_gamma": 0.0, "pos_vega": 0.0, "pos_theta": 0.0,
             "deltacash": round(pos_delta * F * size),
@@ -181,7 +200,7 @@ def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
     # 无标的价（F≤0）：无法计算 Greeks，返回零值（避免 math domain error）
     if not F or F <= 0:
         return {
-            "delta": 0, "gamma": 0, "vega": 0, "theta": 0,
+            "delta": 0, "gamma": 0, "vega": 0, "theta": 0, "delta_norm": 0,
             "pos_delta": 0, "pos_gamma": 0, "pos_vega": 0, "pos_theta": 0,
             "deltacash": 0, "gammacash": 0, "vegacash": 0, "thetacash": 0,
         }
@@ -197,6 +216,7 @@ def calc_greeks(tick: dict, position: dict, contract: dict) -> dict:
         # 可汇总列一律头寸级 = 多头原始值×方向sign×手数；父级直接 Σ 子级
         "delta": pos_delta, "gamma": pos_gamma,
         "vega":  pos_vega,  "theta": pos_theta,
+        "delta_norm": pos_delta * _idx_norm_factor(position['symbol'], size),
         "pos_delta": pos_delta, "pos_gamma": pos_gamma,
         "pos_vega":  pos_vega,  "pos_theta": pos_theta,
         "deltacash": round(pos_delta * F * size),
@@ -296,13 +316,40 @@ def calc_pnl(position: dict, contract: dict, tick: dict,
     if base_today is None and ledger_open and ledger_open > 0:
         base_today, price_basis = ledger_open, "today_open_cost"
     elif has_prev_basis and ledger_open and ledger_open > 0:
-        # 昨仓 + 今开混合：单一基准无法拆分，昨仓基准覆盖全部手数 → 标注待核
-        price_basis = price_basis + "+today_open_mixed"
+        yd = position.get('yd_volume', 0) or 0
+        vol = abs(position['volume'])
+        # 只有昨仓剩余（yd>0）且今开新增（vol>yd）才算混合腿；纯昨仓（yd>=vol）或纯今开（yd=0）走单基准
+        if yd > 0 and yd < vol:
+            # 混合腿（昨仓 + 今开）：按 CTP yd_volume 拆分手数
+            size = contract.get('size', 1)
+            today_vol = max(0, vol - yd)
+            yd_vol = min(yd, vol)
+            # 昨仓部分用昨收调整价；今开部分用账本今开加权价
+            pnl_yd = 0.0
+            pnl_today_vol = 0.0
+            if yd_vol > 0:
+                pnl_yd = direction_sign * (adj_price - base_today) * yd_vol * size
+            if today_vol > 0:
+                pnl_today_vol = direction_sign * (adj_price - ledger_open) * today_vol * size
+            pnl_today = pnl_yd + pnl_today_vol
+            price_basis = "prev_close_snapshot+today_open_split"
+            # 跳过下面单一基准计算
+            base_today = None  # 强制进入 None 分支跳过再计算
+        else:
+            # 纯昨仓（yd>=vol，含 yd==vol 且有账本记录的情况）或纯今开（yd=0）：用单一基准
+            if yd >= vol and yd > 0:
+                # 纯昨仓：保留昨收基准，不进入今开基准
+                pass  # base_today 已有值，price_basis 已有值
+            else:
+                # yd == 0：纯今开，覆盖为今开基准
+                base_today, price_basis = ledger_open, "today_open_cost"
 
-    # 无基准 → pnl_today=None，不参与汇总，也不写 NaN 进快照
-    if base_today is None or base_today != base_today:
+    # 无基准 / 纯昨仓 / 纯今开（非混合）→ 使用统一基准计算
+    # 混合腿已在上面计算完 pnl_today，不覆盖
+    is_mixed = (price_basis == "prev_close_snapshot+today_open_split")
+    if not is_mixed and (base_today is None or base_today != base_today):
         pnl_today = None
-    else:
+    elif not is_mixed:
         pnl_today = direction_sign * (adj_price - base_today) * vol * size
 
     return {
@@ -400,6 +447,8 @@ def _make_summary() -> dict:
         "total_vegacash": 0,  "total_thetacash": 0,
         "total_pnl_today": 0.0, "total_pnl_history": 0.0, "position_count": 0,
         "pnl_basis_counts": {},
+        # PnL 基准计数用于告警 + 义务仓权利金（CTP 口径：空头期权 × open_price × size）
+        "obligation_premium": 0.0,
     }
 
 
@@ -419,7 +468,7 @@ def _accumulate_metrics(metrics: dict, node: dict) -> None:
     metrics["gammacash"]   += m.get('gammacash', 0)
     metrics["vegacash"]    += m.get('vegacash', 0)
     metrics["thetacash"]   += m.get('thetacash', 0)
-    # F1 基准可见性：L3 叶子带 price_basis，逐级合并计数（仅告警/核对用，不参与数值）
+    # PnL 基准可见性：L3 叶子带 price_basis，逐级合并计数（仅告警/核对用，不参与数值）
     _pb = m.get('price_basis')
     if _pb:
         _c = metrics.setdefault('pnl_basis_counts', {})
@@ -435,6 +484,13 @@ def _accumulate_metrics(metrics: dict, node: dict) -> None:
     _v2 = m.get('pnl_history', 0)
     if _v2 is not None and _v2 == _v2:
         metrics["pnl_history"] += _v2
+    # 义务仓权利金累加：L3 取自身字段；L1/L2 向上传递子级已累计的 _obligation_premium_sum
+    if node.get('children') is None and node.get('symbol'):
+        op = m.get('obligation_premium', 0)
+    else:
+        op = m.get('_obligation_premium_sum', 0)
+    if op > 0:
+        metrics['_obligation_premium_sum'] = metrics.get('_obligation_premium_sum', 0) + op
 
 
 def _accumulate_summary(total: dict, metrics: dict, l3_count: int = 1) -> None:
@@ -445,7 +501,7 @@ def _accumulate_summary(total: dict, metrics: dict, l3_count: int = 1) -> None:
     # F1 基准计数并入 summary
     if metrics.get("pnl_basis_counts"):
         _c = total.setdefault("pnl_basis_counts", {})
-        for _k, _v in metrics["pnl_basis_counts"].items():
+        for _k, _v in metrics['pnl_basis_counts'].items():
             _c[_k] = _c.get(_k, 0) + _v
     # NaN 安全
     _tv = metrics.get("pnl_today", 0)
@@ -455,6 +511,10 @@ def _accumulate_summary(total: dict, metrics: dict, l3_count: int = 1) -> None:
     if _hv is not None and _hv == _hv:
         total["total_pnl_history"] += _hv
     total["position_count"]    += l3_count
+    # 义务仓权利金汇总
+    op = metrics.get('_obligation_premium_sum', 0)
+    if op > 0:
+        total['obligation_premium'] = total.get('obligation_premium', 0) + op
 
 
 def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
@@ -485,7 +545,19 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
         K  = contract.get('strike', 0)
         cp = cp_from_symbol(sym)  # FIX #1: 同 calc_greeks，勿用中文 option_type
         itm = (F > K) if cp == 1 else (F < K)
-
+    
+    # 义务仓权利金（当前市值口径：空头期权 × 最新价 × size）
+    obligation_premium = 0.0
+    is_option = bool(contract.get('option_type'))
+    if is_option and direction_str == 'short':
+        size = contract.get('size', 1)
+        vol = abs(pos.get('volume', 0))
+        last_px = tick.get('last_price', 0) or 0
+        if last_px != last_px:  # NaN 防传染
+            last_px = 0.0
+        if last_px > 0:
+            obligation_premium = round(vol * last_px * size, 2)
+    
     return {
         "key":             f"{sym}_{direction_str}",
         "name":            f"{sym}{direction_str}",
@@ -500,7 +572,7 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
         "iv":              tick.get('iv', None),
         "days_to_expiry":  contract.get('days_to_expiry', None),
         "itm":             itm,
-        "delta":  g.get('delta', 0),
+        "delta":  g.get('delta_norm', g.get('delta', 0)),   # 显示/聚合用归一口径（股指系期货×3/×2）；deltacash 用原始 pos_delta 不受影响
         "gamma":  g.get('gamma', 0),
         "vega":   g.get('vega', 0),
         "theta":  g.get('theta', 0),
@@ -515,6 +587,8 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
         "delta_tag": tag_delta(g.get('deltacash', 0)),
         "gamma_tag": tag_gamma(g.get('gammacash', 0)),
         "pnl_tag":   tag_pnl(pnl.get('pnl_history', 0)),
+        # 义务仓权利金（仅用于 summary 汇总）
+        "obligation_premium": obligation_premium,
     }
 
 

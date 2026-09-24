@@ -57,6 +57,7 @@ from dashboard_v2.alert_config import load_sigma_ref as _load_sigma, sigma_ref_m
 
 _shared_lock = threading.RLock()          # 保护 _ctp_status / _worker_thread
 _SERVER_START = time.time()               # 服务进程启动时间（uptime 基准，非客户端计时）
+_COLUMNS_LOADED = False   # 列配置是否已从盘载入（进程级，首次 GET/POST 触发）
 _shared_state = {
     "positions": [],          # list[dict]  最新持仓快照
     "underlying_prices": {},  # {symbol: price}
@@ -634,7 +635,7 @@ def _worker_loop(settlement_dir: str):
     
     def _do_settlement_sync():
         """后台线程目标：执行增量同步并更新 meta。已在调用处启动 daemon 线程。"""
-        global _sync_state
+        nonlocal _sync_state
         
         if _sync_state["running"]:
             return
@@ -1082,6 +1083,7 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             "symbol":        symbol,
             "direction":     direction,
             "volume":        pos_volume,
+            "yd_volume":    getattr(pos, 'yd_volume', 0) or 0,
             "available":     available,
             "price":         open_price,
             "last_price":    last_price,
@@ -1131,10 +1133,18 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         for pos, contract in pos_list:
             sym = pos.vt_symbol.split('.')[0]
             expiry_str = str(contract.option_expiry)[:10] if contract.option_expiry else ""
+            # FIX: option_type 可能是字符串/枚举/None，统一转成大写'C'/'P'
+            ot_raw = contract.option_type or ""
+            if hasattr(ot_raw, 'value'):
+                ot_str = ot_raw.value.upper()
+            elif isinstance(ot_raw, str):
+                ot_str = ot_raw.upper().strip()
+            else:
+                ot_str = ""
             contracts[sym] = {
                 "size":           contract.size or 1,
                 "product_type":   "OPTION",
-                "option_type":    contract.option_type.value if contract.option_type else "",
+                "option_type":    ot_str,  # 'C' 或 'P'
                 "strike":         contract.option_strike or 0,
                 "days_to_expiry": days_to_expiry(expiry_str),
             }
@@ -1207,25 +1217,37 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         # Margin 风险度分档（95%/110% 两级）
         margin_ratio = None
         margin_headroom = None
+        strict_risk_ratio = None
         level = "unknown"
-        if account_data:
+        if account_data and tree.get('summary'):
             m = _get_thresh("margin_ratio_warn")
             d = _get_thresh("margin_ratio_danger")
             bal = account_data.get("balance", 0) or 0
             mg = account_data.get("margin", 0) or 0
+            obl_prem = tree.get('summary', {}).get('obligation_premium', 0) or 0
             if bal > 0:
                 ratio_pct = mg / bal * 100.0
+                strict_risk_ratio = round((mg + obl_prem) / bal * 100.0, 2)
+                # 滞回防抖：进入用原阈值，退出需低于阈值-缓冲（防 85% 边缘横跳刷记录）
+                _MARG_HYST = 0.5   # 百分点，可调
+                prev_lv = _shared_state.get("_margin_prev_level")
                 if ratio_pct >= d:
                     level = "danger"
                 elif ratio_pct >= m:
                     level = "warn"
+                elif prev_lv == "danger" and ratio_pct >= d - _MARG_HYST:
+                    level = "danger"   # danger 缓冲带内保持，不降级
+                elif prev_lv == "warn" and ratio_pct >= m - _MARG_HYST:
+                    level = "warn"     # warn 缓冲带内保持，不消除
                 else:
                     level = "ok"
+                _shared_state["_margin_prev_level"] = level
                 margin_ratio = round(ratio_pct, 2)
                 margin_headroom = round(bal * d / 100.0 - mg, 2)
         _shared_state["margin_status"] = {
             "ratio_pct": margin_ratio,
             "headroom": margin_headroom,
+            "strict_risk_ratio": strict_risk_ratio,
             "level": level,
         }
 
@@ -1643,7 +1665,32 @@ def api_snapshot_load():
 #   原则：只复用 _poll_once 已拿到的数据，不新增定时任务，不落盘
 # ══════════════════════════════════════════════════════════════════════════
 
+_ALERT_WARMUP = True
 _ALERT_COOLDOWN = {"warn": 600, "danger": 300}   # 冷却（秒）：黄10min 红5min
+
+def _any_symbol_trading(now_ts=None):
+    """全品种并集：任一持仓品种在交易时段即 True。无持仓/查询异常 → True 放行。"""
+    try:
+        from dashboard_v2.alert_config import in_trading_session
+        now = now_ts or time.time()
+        prods = _shared_state.get("_held_products") or set()
+        if not prods:
+            return True
+        return any(in_trading_session(p, now) for p in prods)
+    except Exception:
+        return True
+
+def _alert_window_ok(source, und, now_ts=None):
+    """触发/消除弹窗的窗口门：非交易时段只拦弹窗，记录照写。"""
+    try:
+        from dashboard_v2.alert_config import in_trading_session
+        if source == 'margin':
+            return _any_symbol_trading(now_ts)   # margin 是账户级 → 全品种并集
+        now = now_ts or time.time()
+        return in_trading_session(und, now)
+    except Exception:
+        return True
+
 _ALERT_DAILY_MAX = 3                             # 同一告警当日弹窗上限
 _ALERT_RING_MAX = 100                            # 历史 ring buffer 上限
 _IV_WINDOW_SEC = 300                             # IV 滚动窗口 5min
@@ -1716,22 +1763,22 @@ def _conv_delta(symbol, F, K, days):
 
 def _compute_f_rate(underlying_prices, now_ts):
     """
-    品种级 F 速率 = ln(5min窗口内标的最高/最低) / (σ_ref × √(5min/年))。
-    分母 √ 内 = 5min / (250交易日 × 60min × 日交易总时长h)，即「5min 占一年的比例」。
-    采样仍是秒级；5min 只是观测窗口，窗口规则与 IV 速率一致（相邻样本间隔 >4h 断档清空）。
-    返回 {und: (rate, 窗口最低价, 窗口最高价)}。
+    合约级 F 速率 = ln(5min窗口内该合约最高/最低) / (σ_ref × √(5min/年))。
+    按月份合约分别计算（RU2611/RU2612 各自独立窗口，跨月价差不互相污染）；
+    σ_ref / 交易时长仍是品种级配置。
+    返回 {sym: (rate, 窗口最低价, 窗口最高价)}，sym 如 RU2611。
     """
     import math
     samples = _shared_state.setdefault("_f_samples", {})
     out = {}
     for full_und, price in (underlying_prices or {}).items():
-        sym = full_und.split(".")[0]
+        sym = full_und.split(".")[0].upper()
         und = normalize_underlying(sym)
         if not price or price <= 0:
             continue
-        dq = samples.get(und)
+        dq = samples.get(sym)
         if dq is None:
-            dq = samples[und] = deque()
+            dq = samples[sym] = deque()
         if dq and (now_ts - dq[-1][0]) > _IV_GAP_SEC:
             dq.clear()
         dq.append((now_ts, price))
@@ -1749,7 +1796,7 @@ def _compute_f_rate(underlying_prices, now_ts):
         if scale <= 0:
             continue
         # (速率, 窗口最低, 窗口最高) —— 两端值与告警值严格一致
-        out[und] = (math.log(hi / lo) / scale, lo, hi)
+        out[sym] = (math.log(hi / lo) / scale, lo, hi)
     return out
 
 
@@ -1786,31 +1833,34 @@ def _atm_iv_of_group(pos_list, option_greeks):
 
 def _compute_iv_rate(by_underlying, option_greeks, now_ts):
     """
-    品种级 ATM IV 速率 = (5min窗口 IV 极差) / σ_ref，5min 滚动窗口。
-    单位 = **百分数**（值 5.0 即 5%，即极差占 σ_ref 的 5%）；与阈值 iv_rate_warn 同量纲，直接比。
-    断档规则：相邻样本间隔 > 4h → 清空窗口重计。
-    返回 {und: (rate, 窗口低点, 窗口高点)}，低/高点为 IV 原值（vol 点）。
+    合约级 ATM IV 速率 = (5min窗口 IV 极差) / σ_ref，5min 滚动窗口。
+    按月份合约分别计算（SC2611/SC2612 各自独立窗口，互不平滑）；
+    单位 = 百分数（值 5.0 即 5%）；断档 >4h 清空。
+    返回 {sym: (rate, 窗口低点, 窗口高点)}，sym 如 SC2611（月键 = 标的期货合约代码）。
     """
-    # 1. 汇总每个品种当前 ATM IV（同品种按月分组，取样本最多的月）
-    per_und = defaultdict(dict)   # {und: {expiry: iv}}
+    per_sym = {}   # {期货合约代码如 SC2611: 当前 ATM IV}
     for (und_raw, expiry), pos_list in (by_underlying or {}).items():
+        if not und_raw:
+            continue
         und = normalize_underlying(und_raw) if und_raw else ""
         if not und:
             continue
         iv = _atm_iv_of_group(pos_list, option_greeks)
-        if iv is not None:
-            per_und[und][expiry] = iv
+        if iv is None:
+            continue
+        # 月键：标的期货合约代码（CFFEX 期权前缀 MO → 期货 IM；月号已在 und 尾部）
+        sym_up = und_raw.upper()
+        sym = ("IM" + sym_up[2:]) if sym_up.startswith("MO") else sym_up
+        per_sym[sym] = iv
 
     samples = _shared_state.setdefault("_iv_samples", {})
     out = {}
-    for und, by_exp in per_und.items():
-        ivs = sorted(by_exp.values())
-        n = len(ivs)
-        iv_now = ivs[n // 2] if n % 2 == 1 else (ivs[n // 2 - 1] + ivs[n // 2]) / 2.0
-        dq = samples.get(und)
+    for sym, iv_now in per_sym.items():
+        und = normalize_underlying(sym)
+        dq = samples.get(sym)
         if dq is None:
             dq = deque()
-            samples[und] = dq
+            samples[sym] = dq
         # 断档检测：与上一样本间隔 > 4h → 清空
         if dq and (now_ts - dq[-1][0]) > _IV_GAP_SEC:
             dq.clear()
@@ -1824,8 +1874,8 @@ def _compute_iv_rate(by_underlying, option_greeks, now_ts):
             lo, hi = min(vals), max(vals)
             if lo > 0:
                 # 口径：5min IV 极差占 σ_ref 的比例，用百分数表示（值 5.0 = 5%）
-                #   iv 是百分数、σ_ref 是小数 → (hi-lo)/(σ_ref×100) 是无量纲比，(hi-lo)/σ_ref 即百分号上的数字
-                out[und] = ((hi - lo) / _sigma_of(und), lo, hi)
+                #   iv 是百分数、σ_ref 是小数 → (hi-lo)/σ_ref 即百分号上的数字
+                out[sym] = ((hi - lo) / _sigma_of(und), lo, hi)
     return out
 
 
@@ -1904,12 +1954,17 @@ def _compute_structure(positions_out):
 
 
 def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_status, now_ts):
+    global _ALERT_WARMUP
     """
     汇总五源 → 判级 → 冷却/计数 → 写 alerts / active_flags / active_details / popups。
     返回本轮应弹窗的 popups 列表。
     """
+    _replay_alert_state()   # 启动后首轮：回放落盘的 prev_active / alert_state / alerts
     today = datetime.datetime.fromtimestamp(now_ts).strftime("%Y%m%d")
     events = []   # (source, symbol, value, level, threshold)
+    if _ALERT_WARMUP:
+        _ALERT_WARMUP = False
+        return []
     pts = {}      # (source, symbol) -> (起点值, 报警时值)，仅移动量类告警有
     def _push(source, symbol, value, warn_k, danger_k):
         w = _get_thresh(warn_k)
@@ -1917,6 +1972,8 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
         lv = _level_of(value, w, d)
         if lv:
             thr = d if lv == "danger" else w
+            # 窗口门：非窗口期不弹窗（但记录照写）
+            # 此处简化：直接让 _evaluate_alerts 处理窗口限制（后续交付中已包含）
             events.append((source, symbol, value, lv, thr))
 
     # F / IV 速率是移动量：连同"从多少到多少"的两端一起上报
@@ -1951,7 +2008,10 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
     und_of = {}
     for source, symbol, value, lv, thr in events:
         und = (contract_und or {}).get(symbol) if source == "conv_delta" else symbol
-        und = und or normalize_underlying(symbol)
+        # f_rate/iv_rate 的 symbol 是月份合约（RU2611）→ 归一成品种（RU），active_flags/窗口门/品种下拉保持品种级
+        # margin 的 symbol="ACCOUNT" 非合约代码，normalize 会解析失败，跳过
+        if source != "margin":
+            und = normalize_underlying(und or symbol) or und
         und_of[(source, symbol)] = und
         details.setdefault(source, {})[symbol] = lv
         _bump(und, lv)
@@ -1963,6 +2023,7 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
     prev_active = _shared_state.setdefault("prev_active", {})
     hist = _shared_state.setdefault("alerts", [])
     popups = []
+    _dirty = False
     cur_active = {}
     for source, symbol, value, lv, thr in events:
         key = f"{source}|{symbol}"
@@ -1970,29 +2031,35 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
         # 只在状态跳变（新出现 / 级别变化）时记录+弹窗，持续触发不重复刷屏
         if prev_active.get(key) == lv:
             continue
+        _dirty = True
         alert_id = f"{source}|{symbol}|{lv}"
         st = state.setdefault(alert_id, {})
         if st.get("date") != today:
             st.update(date=today, count=0, last_popup=0.0)
         should = False
-        if st["count"] < _ALERT_DAILY_MAX:
-            cd = _ALERT_COOLDOWN.get(lv, 600)
-            if now_ts - st.get("last_popup", 0.0) >= cd:
-                st["count"] += 1
-                st["last_popup"] = now_ts
-                should = True
         und = und_of.get((source, symbol)) or symbol
+        # 窗口门：非交易时段跳变只记录不弹窗、不耗当日计数（规格：非窗口期只拦弹窗不拦记录）
+        if _alert_window_ok(source, und, now_ts):
+            if st["count"] < _ALERT_DAILY_MAX:
+                cd = _ALERT_COOLDOWN.get(lv, 600)
+                if now_ts - st.get("last_popup", 0.0) >= cd:
+                    st["count"] += 1
+                    st["last_popup"] = now_ts
+                    should = True
         p0, p1 = pts.get((source, symbol), (None, None))
-        tail = f"（{p0:.4g} → {p1:.4g}）" if p0 is not None and p1 is not None else ""
-        if source == "conv_delta":
-            msg = (f"换算Δ·红 {und} {symbol} |Δ|={value:.4g} 已越界实值" if lv == "danger"
-                   else f"换算Δ·黄 {und} {symbol} |Δ|={value:.4g} ≥ {thr:.4g}")
-        elif source == "margin":
-            msg = f"保证金·{'红' if lv == 'danger' else '黄'} 风险度 {value:.4g}% ≥ {thr:.4g}%"
-        else:
-            # 移动量类带单位：F 速率是倍数，IV 速率是百分数（阈值框里填的就是这个数）
-            unit = {"f_rate": "倍", "iv_rate": "%"}.get(source, "")
-            msg = f"{source}·{'红' if lv == 'danger' else '黄'} {und} {value:.4g}{unit} ≥ {thr:.4g}{unit}{tail}"
+        # 最简格式：{类型} {对象}: {值}，{低点→报警点}（仅移动量类有尾段）；背景色已表达级别，无红黄字样/阈值
+        if source == "f_rate":
+            tail = f"，{p0:.0f}→{p1:.0f}" if p0 is not None and p1 is not None else ""
+            msg = f"F_rate {symbol}: {value:.2f}{tail}"
+        elif source == "iv_rate":
+            tail = f"，{p0:.2f}→{p1:.2f}" if p0 is not None and p1 is not None else ""
+            msg = f"IV {symbol}: {value:.2f}{tail}"
+        elif source == "burn":
+            msg = f"Burn {symbol}: {value:.2f}"
+        elif source == "conv_delta":
+            msg = f"Δ {symbol}: {value:.2f}"
+        else:  # margin（账户级，无对象）
+            msg = f"Margin: {value:.2f}"
         rec = {
             "alert_id": alert_id,
             "ts": datetime.datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S"),
@@ -2005,7 +2072,46 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
         hist.append(rec)
         if should:
             popups.append(rec)
+    # 消除事件：prev_active 中本轮消失的 warn/danger → normal（记录 + 条件弹窗，窗口门同触发）
+    for key, lv in list(prev_active.items()):
+        if key in cur_active or lv not in ("warn", "danger"):
+            continue
+        _dirty = True
+        source, symbol = key.split("|", 1)
+        und = (contract_und or {}).get(symbol) if source == "conv_delta" else symbol
+        # 同触发侧：合约键归一成品种；ACCOUNT 跳过；und 缺失回退 symbol 本身
+        if source != "margin":
+            und = normalize_underlying(und or symbol) or und
+        alert_id = f"{source}|{symbol}|normal"
+        st = state.setdefault(alert_id, {})
+        if st.get("date") != today:
+            st.update(date=today, count=0, last_popup=0.0)
+        should = False
+        if _alert_window_ok(source, und, now_ts):
+            if st["count"] < _ALERT_DAILY_MAX:
+                cd = _ALERT_COOLDOWN.get(lv, 600)
+                if now_ts - st.get("last_popup", 0.0) >= cd:
+                    st["count"] += 1
+                    st["last_popup"] = now_ts
+                    should = True
+        rec = {
+            "alert_id": alert_id,
+            "ts": datetime.datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source, "level": "normal", "symbol": symbol, "underlying": und,
+            "value": None, "v_from": None, "v_to": None,
+            "threshold": None, "msg": f"{symbol} 已恢复正常", "popup": should,
+        }
+        hist.append(rec)
+        if should:
+            popups.append(rec)
     _shared_state["prev_active"] = cur_active
+    if _dirty:
+        _save_alert_state({
+            "prev_active": cur_active,
+            "alert_state": state,
+            "alerts": hist[-_ALERT_RING_MAX:],
+            "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
     if len(hist) > _ALERT_RING_MAX:
         del hist[: len(hist) - _ALERT_RING_MAX]
     return popups
@@ -2346,7 +2452,23 @@ def create_app(settlement_dir: str = "结算单", static_folder=None, template_f
 
     @app.route("/api/columns")
     def _get_columns():
-        """返回当前列配置（含顺序、显隐、fmt掩码）"""
+        """返回当前列配置（含顺序、显隐、fmt掩码）；进程首次访问时从盘载入"""
+        global _COLUMNS_LOADED
+        if not _COLUMNS_LOADED:
+            _COLUMNS_LOADED = True
+            try:
+                import os as _os
+                from dashboard_v2.alert_config import CONFIG_DIR
+                path = _os.path.join(CONFIG_DIR, "columns_config.json")
+                if _os.path.exists(path):
+                    with open(path, encoding="utf-8") as f:
+                        cols = json.load(f)
+                    if isinstance(cols, list) and len(cols) >= 14:
+                        with _shared_lock:
+                            _shared_state["column_config"] = cols
+                        logger.info(f"[columns] 已从 {path} 载入列配置")
+            except Exception as e:
+                logger.error(f"[columns] 载入失败: {e}")
         with _shared_lock:
             cols = _shared_state.get("column_config", None)
         if cols is None:
@@ -2355,13 +2477,29 @@ def create_app(settlement_dir: str = "结算单", static_folder=None, template_f
 
     @app.route("/api/columns", methods=["POST"])
     def _save_columns():
-        """保存列配置"""
+        """保存列配置：内存 + 落盘 config/columns_config.json（重启/换设备不丢）"""
         data = request.get_json()
         if not data or "columns" not in data:
             return jsonify({"error": "invalid payload"}), 400
         cols = data["columns"]
+        if not isinstance(cols, list) or len(cols) < 14:
+            return jsonify({"error": "invalid payload"}), 400
         with _shared_lock:
             _shared_state["column_config"] = cols
+        global _COLUMNS_LOADED
+        try:
+            import os as _os
+            from dashboard_v2.alert_config import CONFIG_DIR
+            _os.makedirs(CONFIG_DIR, exist_ok=True)
+            path = _os.path.join(CONFIG_DIR, "columns_config.json")
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cols, f, ensure_ascii=False)
+            _os.replace(tmp, path)
+            _COLUMNS_LOADED = True
+        except Exception as e:
+            logger.error(f"[/api/columns] 落盘失败: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 500
         return jsonify({"ok": True})
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2514,3 +2652,53 @@ def create_app(settlement_dir: str = "结算单", static_folder=None, template_f
         return jsonify(result)
 
     return app
+
+# ══════════════════════════════════════════════════════════════════════════
+# 告警状态持久化（重启不丢状态、消除事件独立冷却）
+# ══════════════════════════════════════════════════════════════════════════
+_ALERT_STATE_FILE = "C:/qproj/快照/alert_state.json"
+
+def _load_alert_state():
+    try:
+        import os
+        if os.path.exists(_ALERT_STATE_FILE):
+            with open(_ALERT_STATE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_alert_state(state):
+    """原子写：tmp + os.replace，防止写一半崩溃留坏文件。"""
+    try:
+        import os
+        tmp = _ALERT_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, _ALERT_STATE_FILE)
+    except Exception:
+        pass
+
+_ALERT_STATE_LOADED = False
+
+def _replay_alert_state():
+    """服务启动后首轮评估前，把落盘的 prev_active / alert_state / alerts 回放进 _shared_state（只回放一次）。"""
+    global _ALERT_STATE_LOADED
+    if _ALERT_STATE_LOADED:
+        return
+    _ALERT_STATE_LOADED = True
+    data = _load_alert_state()
+    if not data:
+        return
+    if data.get("prev_active") is not None:
+        _shared_state["prev_active"] = dict(data["prev_active"])
+    if data.get("alert_state") is not None:
+        _shared_state["alert_state"] = dict(data["alert_state"])
+    if data.get("alerts") is not None:
+        _shared_state["alerts"] = list(data["alerts"])
+    try:
+        logger.info(f"[alert] 状态回放：prev={len(data.get('prev_active') or {})} "
+                    f"state={len(data.get('alert_state') or {})} hist={len(data.get('alerts') or [])}")
+    except Exception:
+        pass
+

@@ -307,6 +307,36 @@ def hours_of(product: str, fallback: float | None = None) -> float | None:
     return row["hours"] if row else fallback
 
 
+def in_trading_session(product: str, now: float | None = None) -> bool:
+    """
+    当前时刻是否落在该品种交易时段内（sessions 含跨零点串如 '21:00-02:30'）。
+    CSV 查不到该品种 / 无 sessions → True（放行，不误杀告警）。
+    """
+    row = get_trading_hours(product)
+    if not row or not row.get("sessions"):
+        return True
+    dt = datetime.fromtimestamp(now) if now else datetime.now()
+    cur = dt.hour * 60 + dt.minute
+    for span in row["sessions"]:
+        try:
+            a, b = str(span).split("-")
+            ah, am = a.strip().split(":")
+            bh, bm = b.strip().split(":")
+            start = int(ah) * 60 + int(am)
+            end = int(bh) * 60 + int(bm)
+        except Exception:
+            continue
+        if end < start:  # 跨零点（21:00-02:30）：凌晨 0 点后归属前一日夜盘尾段
+            end += 24 * 60
+            if cur < 12 * 60:
+                cur += 24 * 60
+        if start <= cur <= end:
+            return True
+        if cur >= 24 * 60:  # 已加 24h 仍早于 start → 恢复后继续比下一时段
+            cur -= 24 * 60
+    return False
+
+
 def sigma_ref_pending(held_products: list[str]) -> list[dict]:
     """
     列出「有持仓但 σ_ref 未填」的品种（弹窗只提示这些，全月无持仓不打扰）。

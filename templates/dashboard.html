@@ -37,6 +37,8 @@ tbody tr { border-bottom: 1px solid #1a2332; }
 tbody tr:hover { background: #1a2535; }
 tbody td { text-align: right; padding: 6px 8px; font-size: 12px; white-space: nowrap; }
 tbody td:first-child, tbody td:nth-child(2) { text-align: left; }
+tfoot td { padding: 6px 8px; font-size: 12px; white-space: nowrap; }
+tfoot td:first-child { text-align: left; }
 
 /* 折叠箭头 */
 .td-toggle { cursor: pointer; padding-left: 4px !important; width: 20px; }
@@ -254,7 +256,6 @@ td.alert-danger { background: rgba(239,68,68,0.20) !important; box-shadow: inset
   <h1>📊 期权持仓监控</h1>
   <div class="status">
     <span>CTP连接: <span class="val" id="ctp-status">-</span></span>
-    <span>持仓: <span class="val" id="cnt">0</span> 条</span>
     <span>更新时间: <span class="val" id="lastUpdate">-</span></span>
     <span>服务已运行: <span class="val" id="uptime">0:00:00</span></span>
   </div>
@@ -332,14 +333,10 @@ td.alert-danger { background: rgba(239,68,68,0.20) !important; box-shadow: inset
 </div>
 
 <div class="summary-bar">
-  <div class="summary-item"><div class="label">ΔCash</div><div class="value delta" id="sumDC">-</div></div>
-  <div class="summary-item"><div class="label">ΓCash</div><div class="value gamma" id="sumGC">-</div></div>
-  <div class="summary-item"><div class="label">VegaCash</div><div class="value vega" id="sumVC">-</div></div>
-  <div class="summary-item"><div class="label">ΘCash</div><div class="value theta" id="sumTC">-</div></div>
-  <div class="summary-item"><div class="label">当日盈亏</div><div class="value pnl" id="sumPnlT">-</div></div>
-  <div class="summary-item"><div class="label">浮动盈亏</div><div class="value pnl" id="sumPnlH">-</div></div>
-  <div class="summary-item"><div class="label">持仓数</div><div class="value" id="posCount">-</div></div>
-  <div class="summary-item"><div class="label">风险度</div><div class="value" id="sumMargin">-</div></div>
+  <div class="summary-item"><div class="label">市值权益</div><div class="value" id="sumEquity">-</div></div>
+  <div class="summary-item"><div class="label">当日盈亏</div><div class="value" id="sumPnlT">-</div></div>
+  <div class="summary-item"><div class="label">浮动盈亏</div><div class="value" id="sumPnlH">-</div></div>
+  <div class="summary-item"><div class="label">风险度</div><div class="value"><span id="sumMargin">-</span> / <span id="sumMarginStrict">-</span></div></div>
 </div>
 
 
@@ -353,6 +350,7 @@ td.alert-danger { background: rgba(239,68,68,0.20) !important; box-shadow: inset
     <tbody id="positionBody">
       <tr><td colspan="20" class="loading">暂无持仓数据，请先连接CTP</td></tr>
     </tbody>
+    <tfoot id="sumFoot"></tfoot>
   </table>
 </div>
 
@@ -404,6 +402,6 @@ td.alert-danger { background: rgba(239,68,68,0.20) !important; box-shadow: inset
   </div>
 </div>
 
-<script src="/static/dashboard11.js?v=23"></script>
+<script src="/static/dashboard11.js?v=29"></script>
 </body>
 </html>
