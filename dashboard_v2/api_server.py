@@ -733,6 +733,13 @@ def _worker_loop(settlement_dir: str):
                 if not _td_logged_in(eng):
                     # 掉线 → 丢弃旧引擎（不 close！CtpTdApi.exit() 持 GIL 阻塞会冻死
                     # 整个解释器），回外层走重连阶梯建新引擎。对齐旧版 _do_retry_loop。
+                    # 非交易时段（全品种并集）掉线 → 不自动重连，报错等手动（手动连接不判时段）
+                    if not _any_symbol_trading():
+                        logger.info("[_worker_loop] 非交易时段掉线，停止自动重连，等待手动连接")
+                        _set_status("error",
+                                    "非交易时段掉线，已停止自动重连（可手动重连）",
+                                    alive=False)
+                        return
                     disconnect_retry_count += 1
                     if disconnect_retry_count <= _RETRY_FAST_ATTEMPTS:
                         _set_status("connecting",
@@ -781,6 +788,11 @@ def _worker_loop(settlement_dir: str):
             _set_status("error", err, alive=False)
             return
         attempts += 1
+        # 非交易时段连接失败 → 不重试，停机等手动（手动连接不判时段）
+        if not _in_any_session():
+            logger.info("[_worker_loop] 非交易时段连接失败，停止自动重试，等待手动连接")
+            _set_status("error", "非交易时段，已停止自动重试（可手动重连）", alive=False)
+            return
         if attempts <= _RETRY_FAST_ATTEMPTS:
             _set_status("connecting",
                         f"{err}｜第{attempts}/{_RETRY_FAST_ATTEMPTS}次重试，{_RETRY_FAST_INTERVAL}s后")
@@ -1538,6 +1550,7 @@ def _save_close_snapshot(snap, bd: str, now: datetime.datetime):
             "tree": snap["tree"],
         },
         "account": snap["account"],
+        "dashboard": _dashboard_payload(snap),
     }
     _ensure_snapshot_dir()
     filepath = _snapshot_path(_close_snapshot_name(bd))
@@ -1576,6 +1589,7 @@ def api_snapshot_save():
                 "tree": snap["tree"],
             },
             "account": snap["account"],
+            "dashboard": _dashboard_payload(snap),
         }
         _ensure_snapshot_dir()
         filepath = _os.path.join(_SNAPSHOT_DIR, "data_snapshot_current.json")
@@ -1651,6 +1665,7 @@ def api_snapshot_load():
         "trading_date": raw_file.get("trading_date", ""),
         "saved_at": raw_file.get("saved_at", ""),
         "ctp_status": raw_file.get("ctp_status", ""),
+        "dashboard": raw_file.get("dashboard", {}),
         "summary": computed.get("summary", {}),
         "tree": computed.get("tree", []),
         "positions": raw.get("positions", []),
@@ -1679,6 +1694,21 @@ def _any_symbol_trading(now_ts=None):
         return any(in_trading_session(p, now) for p in prods)
     except Exception:
         return True
+
+def _in_any_session(now_ts=None):
+    """交易时段表全品种并集（不限持仓）：任一品种在时段内即 True。
+    用于初始连接失败守卫——刚重启时 _held_products 为空，不能按持仓判。
+    纯时钟判断，不判星期几。空表/异常 → True 放行。"""
+    try:
+        from dashboard_v2.alert_config import in_trading_session, load_trading_hours
+        now = now_ts or time.time()
+        prods = list(load_trading_hours().keys())
+        if not prods:
+            return True
+        return any(in_trading_session(p, now) for p in prods)
+    except Exception:
+        return True
+
 
 def _alert_window_ok(source, und, now_ts=None):
     """触发/消除弹窗的窗口门：非交易时段只拦弹窗，记录照写。"""
@@ -1813,6 +1843,9 @@ def _atm_iv_of_group(pos_list, option_greeks):
             continue
         iv = g.get("iv")
         if iv is None or iv <= 0:
+            continue
+        # default fallback 不允许进入 IV 异动告警（仅 market / ref_iv 参与）
+        if g.get("iv_source") == "default":
             continue
         d = _conv_delta(pos.vt_symbol, g.get("underlying_price"), g.get("strike"), g.get("days_to_expiry"))
         if d is None:
@@ -2072,10 +2105,21 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
         hist.append(rec)
         if should:
             popups.append(rec)
-    # 消除事件：prev_active 中本轮消失的 warn/danger → normal（记录 + 条件弹窗，窗口门同触发）
+    # 消除事件：prev_active 中本轮消失的 warn/danger → normal（连续 3 采样正常才解除）
+    normal_counts = _shared_state.setdefault("normal_counts", {})
     for key, lv in list(prev_active.items()):
         if key in cur_active or lv not in ("warn", "danger"):
+            # 仍触发 → 重置连续正常计数
+            if key in normal_counts:
+                normal_counts[key] = 0
             continue
+        # 本轮消失：增加连续正常计数
+        normal_counts[key] = normal_counts.get(key, 0) + 1
+        if normal_counts.get(key, 0) < 3:
+            # 未达 3 次连续正常，不记录 normal、不弹窗（计数已增，继续观察）
+            continue
+        # 连续 3 采样正常 → 解除（记录 + 条件弹窗，窗口门同触发）
+        normal_counts[key] = 0  # 解除后重置
         _dirty = True
         source, symbol = key.split("|", 1)
         und = (contract_und or {}).get(symbol) if source == "conv_delta" else symbol
@@ -2117,23 +2161,21 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
     return popups
 
 
-@api_bp.route("/dashboard", methods=["GET"])
-def api_dashboard():
-    """返回完整看板快照（持仓树 + Greeks + 账户 + CTP状态）"""
-    snap = _snapshot()
-    payload = {
-        "status": snap["ctp_status"],
-        "error": snap["ctp_error"],
-        "last_update": snap["last_update"],
+def _dashboard_payload(snap):
+    """构造与 /api/dashboard 一致的完整看板载荷，供实时响应和切片复用。"""
+    return {
+        "status": snap.get("ctp_status", ""),
+        "error": snap.get("ctp_error", ""),
+        "last_update": snap.get("last_update", ""),
         "uptime_seconds": int(time.time() - _SERVER_START),
-        "summary": snap["summary"],
-        "tree": snap["tree"],
-        "positions": snap["positions"],
-        "underlying_prices": snap["underlying_prices"],
-        "account": snap["account"],
-        "worker_alive": snap["worker_alive"],
-        "settlement_dict": snap["settlement_dict"],
-        "settlement_prices": snap["settlement_prices"],
+        "summary": snap.get("summary", {}),
+        "tree": snap.get("tree", []),
+        "positions": snap.get("positions", []),
+        "underlying_prices": snap.get("underlying_prices", {}),
+        "account": snap.get("account", {}),
+        "worker_alive": snap.get("worker_alive", False),
+        "settlement_dict": snap.get("settlement_dict", {}),
+        "settlement_prices": snap.get("settlement_prices", {}),
         "margin_status": snap.get("margin_status", {}),
         "hours_missing": sorted(snap.get("hours_missing") or []),
         "alerts": _alerts_today(snap.get("alerts", [])),
@@ -2142,6 +2184,13 @@ def api_dashboard():
         "contract_und": snap.get("contract_und", {}),
         "popups": snap.get("popups", []),
     }
+
+
+@api_bp.route("/dashboard", methods=["GET"])
+def api_dashboard():
+    """返回完整看板快照（持仓树 + Greeks + 账户 + CTP状态）"""
+    snap = _snapshot()
+    payload = _dashboard_payload(snap)
     return jsonify(_clean_nan(payload))
 
 

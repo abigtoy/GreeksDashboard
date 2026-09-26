@@ -1186,15 +1186,27 @@ async function onSnapSelect(name) {
     return;
   }
   State.snapshotMode = true;
-  State.snapshot = {
-    status: 'snapshot',
-    tree: data.tree || [],
-    summary: data.summary || {},
-    positions: data.positions || [],
-  };
+  const snapshot = (data.dashboard && typeof data.dashboard === 'object'
+    && Object.keys(data.dashboard).length > 0)
+    ? data.dashboard
+    : {
+        status: 'snapshot',
+        tree: data.tree || [],
+        summary: data.summary || {},
+        positions: data.positions || [],
+        account: data.account || {},
+        margin_status: {},
+        underlying_prices: data.underlying_prices || {},
+        active_flags: {},
+        active_details: {},
+        contract_und: {},
+        alerts: [],
+        popups: [],
+      };
+  State.snapshot = snapshot;
   State.expandedG.clear();
   State.expandedM.clear();
-  (data.tree || []).forEach(l1 => {
+  (State.snapshot.tree || []).forEach(l1 => {
     State.expandedG.add(l1.key);
     (l1.children || []).forEach(l2 => State.expandedM.add(l2.key));
   });

@@ -370,11 +370,13 @@ def price_options_batch(symbols, option_ticks, settlement_data, ref_legs=None):
 
             # IV：价来自市场证据时反推；反推无解/出界/只有昨收 → 退参考 IV → 默认 20%
             iv = ref_iv or _REF_IV_DEFAULT
+            iv_source = 'ref_iv' if (ref_iv and ref_iv > 0) else 'default'
             if (mkt_price > 0 and price_basis != 'pre_close'
                     and s > 0 and k > 0 and ttm > 0):
                 raw_iv = implied_vol_bisection(adj_price, s, k, ttm, _R_PARAM, cp, strict=True)
                 if raw_iv == raw_iv and _REF_IV_MIN <= raw_iv <= _REF_IV_MAX:
                     iv = raw_iv
+                    iv_source = 'market'
 
             g = black76(iv, s, k, ttm, _R_PARAM, cp)
             for gk in ('delta', 'gamma', 'theta', 'vega'):
@@ -398,6 +400,7 @@ def price_options_batch(symbols, option_ticks, settlement_data, ref_legs=None):
 
             results[vt_sym] = {
                 'iv':              round(iv * 100, 2),
+                'iv_source':      iv_source,
                 # 可汇总列一律头寸级（原始×方向×手数），父级 Σ 子级
                 'delta':           pos_delta,
                 'gamma':           pos_gamma,

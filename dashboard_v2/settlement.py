@@ -272,7 +272,7 @@ def _missing_dates() -> list[str]:
     """
     today = datetime.now().date()
     all_trading = _trading_dates_up_to(today, LOOKBACK_DAYS)
-    scanned     = _scanned_dates()
+    scanned     = _valid_dates()
     missing = [d for d in all_trading if d not in scanned]
     return missing   # 已按旧→新排序
 
@@ -323,8 +323,8 @@ class SettlementManager:
         today_str = _cutoff_date()
         _now = datetime.now()
         if _now.hour * 60 + _now.minute >= 20 * 60 + 20:
-            # 检查当天是否已入库（防止重复下载）
-            if today_str not in _scanned_dates():
+            # 检查当天是否已入库（有效结算单存在才算已下载）
+            if today_str not in _valid_dates():
                 ok, err = self._download_and_parse(today_str)
                 if ok:
                     results["today_updated"] = True

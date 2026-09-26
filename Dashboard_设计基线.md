@@ -74,7 +74,7 @@
                  ▼
 [ 内存计算 Worker 线程 (每秒定时) ]
   1. 代码归一化与标的映射 (CFFEX IO→IF, MO→IM, HO→IH)
-  2. adjust_price 测算（ITM/OTM/正常 三级，见 §3.2）
+  2. adjust_price 测算（ITM/OTM/正常 四级阶梯 + 兜底，见 §3.2）
   3. implied_vol_bisection：用 adjust_price 反推 IV → 写入 tick['iv']
   4. 标准 Black-76 单合约 Greeks 计算（含期货特判分支）
   5. Cash Greeks 换算（统一量纲）
@@ -83,8 +83,8 @@
   8. 树形层级预聚合：L1 品种 -> L2 月份 -> L3 合约
   9. 成交回报账本：EVENT_TRADE → trade_ledger.json 落盘 + 已实现盈亏累加（v1.5，§3.8）
                  │
-                 ▼ 原子替换 (Atomic Swap)
-[ 全局内存只读快照 (_dashboard_snapshot，不可变对象）]
+                 ▼ RLock 保护 shared_state（_shared_state 写，API 读）
+[ 全局内存只读快照（由 _poll_once 写入 _shared_state，API 从 _shared_state 直接引用，不做原地修改）]
                  │
                  ▼ 纯内存读取 (<2ms, 无锁零竞争)
 [ Flask Web API ]
@@ -349,8 +349,13 @@ def black76(IV: float, F: float, K: float, T: float, r: float = 0.02, cp: int = 
 
 
 def implied_vol_bisection(price: float, F: float, K: float, T: float,
-                           r: float = 0.02, cp: int = 1, tol: float = 0.0001) -> float:
-    """二分法反推 IV。参数顺序：price, F, K, T, r, cp。返回小数形式。收敛失败返回 0.20 兜底。"""
+                           r: float = 0.02, cp: int = 1, tol: float = 0.0001,
+                           strict: bool = False) -> float:
+    """二分法反推 IV。参数顺序：price, F, K, T, r, cp。返回小数形式。
+    strict=False（兼容旧行为）：收敛失败兜底返回 0.20；
+    strict=True（当前主路径）：无解/不收敛返回 NaN，由调用方决定是否降级（不静默造 20%）；
+    当前 `price_options_batch()` 调用时传 `strict=True`，并配合 `iv_source` 标注来源（market / ref_iv / default）。
+    """
     if price <= 0 or F <= 0 or K <= 0:
         return 0.20
     v_low, v_high = 0.001, 5.0
