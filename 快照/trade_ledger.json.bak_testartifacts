@@ -1,0 +1,113 @@
+{
+ "trading_day": "20260928",
+ "trades": [
+  {
+   "dedup_key": "20260928____0_0",
+   "ledger_key": [
+    "20260928",
+    "",
+    "",
+    "",
+    "short"
+   ],
+   "trade_id": "_0_0",
+   "symbol": "",
+   "direction": "",
+   "trade_side": "long",
+   "position_direction": "short",
+   "open_close": "平",
+   "offset_flag": "close_yesterday",
+   "allocation_source": "fifo_fallback",
+   "price": 0.0,
+   "volume": 0,
+   "trade_time": "",
+   "account": "",
+   "exchange": "",
+   "trading_day": "20260928",
+   "cost_price": 0.0,
+   "cost_basis": "n/a",
+   "realized_pnl": 0.0
+  },
+  {
+   "dedup_key": "20260928_CTP_CFFEX_T1",
+   "ledger_key": [
+    "20260928",
+    "CTP",
+    "CFFEX",
+    "IF2610",
+    "long"
+   ],
+   "trade_id": "T1",
+   "symbol": "IF2610",
+   "direction": "Direction.SHORT",
+   "trade_side": "short",
+   "position_direction": "long",
+   "open_close": "平",
+   "offset_flag": "close_yesterday",
+   "allocation_source": "ctp_offset",
+   "price": 3800.0,
+   "volume": 2,
+   "trade_time": "2026-09-28 13:20:00",
+   "account": "CTP",
+   "exchange": "CFFEX",
+   "trading_day": "20260928",
+   "cost_price": 3800.0,
+   "cost_basis": "unknown_use_trade_price",
+   "realized_pnl": 0.0
+  },
+  {
+   "dedup_key": "20260928_CTP_CFFEX_T1",
+   "ledger_key": [
+    "20260928",
+    "CTP",
+    "CFFEX",
+    "IF2610",
+    "long"
+   ],
+   "trade_id": "T1",
+   "symbol": "IF2610",
+   "direction": "Direction.SHORT",
+   "trade_side": "short",
+   "position_direction": "long",
+   "open_close": "平",
+   "offset_flag": "close_yesterday",
+   "allocation_source": "ctp_offset",
+   "price": 3800.0,
+   "volume": 2,
+   "trade_time": "2026-09-28 13:20:00",
+   "account": "CTP",
+   "exchange": "CFFEX",
+   "trading_day": "20260928",
+   "cost_price": 3800.0,
+   "cost_basis": "unknown_use_trade_price",
+   "realized_pnl": 0.0
+  },
+  {
+   "dedup_key": "20260928_CTP_CFFEX_T2",
+   "ledger_key": [
+    "20260928",
+    "CTP",
+    "CFFEX",
+    "IF2612",
+    "long"
+   ],
+   "trade_id": "T2",
+   "symbol": "IF2612",
+   "direction": "Direction.LONG",
+   "trade_side": "long",
+   "position_direction": "long",
+   "open_close": "开",
+   "offset_flag": "open",
+   "allocation_source": "ctp_offset",
+   "price": 3900.0,
+   "volume": 1,
+   "trade_time": "2026-09-28 13:20:00",
+   "account": "CTP",
+   "exchange": "CFFEX",
+   "trading_day": "20260928",
+   "cost_price": 0.0,
+   "cost_basis": "n/a",
+   "realized_pnl": 0.0
+  }
+ ]
+}

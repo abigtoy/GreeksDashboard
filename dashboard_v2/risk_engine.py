@@ -250,115 +250,57 @@ def _is_no_tick(tick: dict) -> bool:
 
 def calc_pnl(position: dict, contract: dict, tick: dict,
              settlement_dict: dict,
-             settlement_prices: dict = None,
-             yesterday_snapshot: dict = None,
-             received_today: dict = None,
              today_open_cost: dict = None) -> dict:
-    """contract: 合约元数据，含 size（乘数），必须传入，VNPY PositionData 无 size 字段。
-    无行情（_is_no_tick）或无今日基准 → pnl_today=None：不显示、不参与账户汇总、不写 NaN。
-    today_open_cost: {f"{sym}_{direction}" → 今日账本开仓加权价}，供今开仓腿取基准/成本。
-    返回附带 price_basis（当日盈亏基准来源）与 cost_basis（开仓成本来源），供降级告警与核对。
+    """开仓至今的浮动盈亏（pnl_history）与开仓成本。
+
+    当日盈亏不在这里——它是现金口径，见 calc_pnl_today()。
     """
     sym = position['symbol'].split('.')[0]
-    direction_str  = 'long' if position['direction'] in ('long', '多') else 'short'
-
-    # P0-8 修正：当日盈亏必须基于今日收到的行情推送（None/陈旧缓存价都不算）
-    if received_today is not None and (
-            not received_today.get(sym, False) or _is_no_tick(tick)):
-        return {"pnl_today": None, "pnl_history": 0.0,
-                "price_basis": "no_tick", "cost_basis": "n/a"}
+    direction_str = 'long' if position['direction'] in ('long', '多') else 'short'
+    pos_key = f"{sym}_{direction_str}"
 
     direction_sign = 1 if direction_str == 'long' else -1
-    vol  = abs(position['volume'])  # FIX 2.4: 同 calc_greeks，防带符号 volume × direction_sign 双重取号
+    vol  = abs(position['volume'])
     size = contract.get('size', 1)
 
-    # 已平仓：PnL全部为0，pnl_history 已是历史累计值
     if vol == 0:
-        return {"pnl_today": 0.0, "pnl_history": 0.0,
-                "price_basis": "closed", "cost_basis": "n/a"}
-
-    pos_key = f"{sym}_{direction_str}"
-    ledger_open = (today_open_cost or {}).get(pos_key)  # 今日账本开仓加权价（可能为 None）
+        return {"pnl_history": 0.0, "cost_price": 0.0, "cost_basis": "closed"}
 
     # 开仓成本（pnl_history 基准）：结算单开仓均价 → 今日账本开仓价 → CTP 持仓均价
     # 结算单 key 带方向后缀（IC2612_long），裸名读不到 → 必须用 pos_key
     cost_price = settlement_dict.get(pos_key, 0.0) or 0.0
     cost_basis = "settlement_cost"
     if cost_price <= 0:
-        if ledger_open and ledger_open > 0:
+        ledger_open = (today_open_cost or {}).get(pos_key) or 0.0
+        if ledger_open > 0:
             cost_price, cost_basis = ledger_open, "ledger_open_cost"
         else:
             cost_price = position.get('price', 0.0) or 0.0
             cost_basis = "position_price"
 
-    adj_price  = tick.get('adjust_price', tick.get('last_price', 0))
-
-    # 历史累计浮盈（开仓至今）
+    adj_price = tick.get('adjust_price', tick.get('last_price', 0))
     pnl_history = direction_sign * (adj_price - cost_price) * vol * size
 
-    # 当日盈亏基准链（基线 §3.7）：T-1 close_snapshot（Mark 均值）
-    #   → T-1 昨结算价 settlement_prices（裸 key，仅快照缺失/键不存在时）
-    #   → 今开仓成本（账本加权开仓价，昨结/昨收都没有 = 今开仓腿）
-    #   → None（不计入汇总）
-    # 禁止用同日盘中价凑基准；禁止跨业务日回退更老的快照
-    base_today, price_basis = None, "none"
-    has_prev_basis = False
-    if yesterday_snapshot:
-        prev = yesterday_snapshot.get(pos_key, {})
-        v = prev.get('adjust_price') if prev else None
-        if v and v > 0:
-            base_today, price_basis, has_prev_basis = v, "prev_close_snapshot", True
-    if base_today is None and settlement_prices:
-        v = settlement_prices.get(sym)
-        if v and v > 0:
-            base_today, price_basis, has_prev_basis = v, "prev_settlement_fallback", True
-    # 今开仓腿：按开仓价计当日盈亏（与老系统盯市口径一致）
-    if base_today is None and ledger_open and ledger_open > 0:
-        base_today, price_basis = ledger_open, "today_open_cost"
-    elif has_prev_basis and ledger_open and ledger_open > 0:
-        yd = position.get('yd_volume', 0) or 0
-        vol = abs(position['volume'])
-        # 只有昨仓剩余（yd>0）且今开新增（vol>yd）才算混合腿；纯昨仓（yd>=vol）或纯今开（yd=0）走单基准
-        if yd > 0 and yd < vol:
-            # 混合腿（昨仓 + 今开）：按 CTP yd_volume 拆分手数
-            size = contract.get('size', 1)
-            today_vol = max(0, vol - yd)
-            yd_vol = min(yd, vol)
-            # 昨仓部分用昨收调整价；今开部分用账本今开加权价
-            pnl_yd = 0.0
-            pnl_today_vol = 0.0
-            if yd_vol > 0:
-                pnl_yd = direction_sign * (adj_price - base_today) * yd_vol * size
-            if today_vol > 0:
-                pnl_today_vol = direction_sign * (adj_price - ledger_open) * today_vol * size
-            pnl_today = pnl_yd + pnl_today_vol
-            price_basis = "prev_close_snapshot+today_open_split"
-            # 跳过下面单一基准计算
-            base_today = None  # 强制进入 None 分支跳过再计算
-        else:
-            # 纯昨仓（yd>=vol，含 yd==vol 且有账本记录的情况）或纯今开（yd=0）：用单一基准
-            if yd >= vol and yd > 0:
-                # 纯昨仓：保留昨收基准，不进入今开基准
-                pass  # base_today 已有值，price_basis 已有值
-            else:
-                # yd == 0：纯今开，覆盖为今开基准
-                base_today, price_basis = ledger_open, "today_open_cost"
-
-    # 无基准 / 纯昨仓 / 纯今开（非混合）→ 使用统一基准计算
-    # 混合腿已在上面计算完 pnl_today，不覆盖
-    is_mixed = (price_basis == "prev_close_snapshot+today_open_split")
-    if not is_mixed and (base_today is None or base_today != base_today):
-        pnl_today = None
-    elif not is_mixed:
-        pnl_today = direction_sign * (adj_price - base_today) * vol * size
-
     return {
-        "pnl_today":   round(pnl_today, 2) if pnl_today is not None else None,
         "pnl_history": round(pnl_history, 2),
         "cost_price":  cost_price,
-        "price_basis": price_basis,
         "cost_basis":  cost_basis,
     }
+
+
+def calc_pnl_today(pos_key: str, direction_sign: int, vol: int, size: int,
+                   adj_price: float, cash_flow: dict, prev_mv: dict) -> float:
+    """当日盈亏（现金口径），品种级逐级相加即得合计，无需摊派。
+
+        当日盈亏 = 今持仓市值 − 昨持仓市值 + 今日成交净现金
+
+    cash_flow: {pos_key → 今日卖出成交额 − 买入成交额}，由成交账本汇总。
+    prev_mv:   {pos_key → 昨持仓市值}，取自 T-1 收盘快照。
+    """
+    mv_now  = direction_sign * vol * size * adj_price
+    mv_prev = float(prev_mv.get(pos_key, 0.0) or 0.0)
+    cash    = float(cash_flow.get(pos_key, 0.0) or 0.0)
+    return round(cash + mv_now - mv_prev, 2)
 
 
 # =======================================================================
@@ -366,10 +308,9 @@ def calc_pnl(position: dict, contract: dict, tick: dict,
 # =======================================================================
 def build_tree(positions: list, ticks: dict, contracts: dict,
                settlement_dict: dict,
-               settlement_prices: dict = None,
-               yesterday_snapshot: dict = None,
-               received_today: dict = None,
-               today_open_cost: dict = None) -> dict:
+               today_open_cost: dict = None,
+               cash_flow: dict = None,
+               prev_mv: dict = None) -> dict:
     """
     构建 L1→L2→L3 嵌套树。
     返回: { summary, tree }
@@ -393,9 +334,8 @@ def build_tree(positions: list, ticks: dict, contracts: dict,
         for month in sorted(product_map[product].keys()):
             l3_nodes = []
             for pos in product_map[product][month]:
-                node = _build_l3_node(pos, ticks, contracts,
-                                      settlement_dict, settlement_prices, yesterday_snapshot,
-                                      received_today, today_open_cost)
+                node = _build_l3_node(pos, ticks, contracts, settlement_dict,
+                                      today_open_cost, cash_flow, prev_mv)
                 if node:
                     l3_nodes.append(node)
                     # L3 只进 L2，L1 汇总在 L2→L1 阶段做（避免 L1 双计）
@@ -519,10 +459,9 @@ def _accumulate_summary(total: dict, metrics: dict, l3_count: int = 1) -> None:
 
 def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
                    settlement_dict: dict,
-                   settlement_prices: dict = None,
-                   yesterday_snapshot: dict = None,
-                   received_today: dict = None,
-                   today_open_cost: dict = None) -> dict | None:
+                   today_open_cost: dict = None,
+                   cash_flow: dict = None,
+                   prev_mv: dict = None) -> dict | None:
     sym      = pos['symbol'].split('.')[0]
     contract = contracts.get(sym, {})
     tick     = ticks.get(sym, {})
@@ -532,11 +471,15 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
     g    = calc_greeks(tick, pos, contract)
     tick_with_adj = dict(tick) if tick else {}
     tick_with_adj['adjust_price'] = adj_price
-    pnl = calc_pnl(pos, contract, tick_with_adj, settlement_dict, settlement_prices,
-                   yesterday_snapshot, received_today, today_open_cost)
-
     direction_raw = pos.get('direction', 'long')
     direction_str = 'long' if direction_raw in ('long', '多') else 'short'
+    pos_key = f"{sym}_{direction_str}"
+
+    pnl = calc_pnl(pos, contract, tick_with_adj, settlement_dict, today_open_cost)
+    pnl_today = calc_pnl_today(
+        pos_key, 1 if direction_str == 'long' else -1,
+        abs(pos.get('volume', 0) or 0), contract.get('size', 1) or 1,
+        adj_price, cash_flow or {}, prev_mv or {})
 
     # ITM 判断
     itm = False
@@ -580,9 +523,9 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
         "gammacash": g.get('gammacash', 0),
         "vegacash":  g.get('vegacash', 0),
         "thetacash": g.get('thetacash', 0),
-        "pnl_today":   pnl.get('pnl_today'),
+        "pnl_today":   pnl_today,
         "pnl_history": pnl.get('pnl_history', 0),
-        "price_basis": pnl.get('price_basis', 'none'),
+        "price_basis": "cash_flow",
         "cost_basis":  pnl.get('cost_basis', 'n/a'),
         "delta_tag": tag_delta(g.get('deltacash', 0)),
         "gamma_tag": tag_gamma(g.get('gammacash', 0)),

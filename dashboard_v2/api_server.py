@@ -125,6 +125,7 @@ _REALIZED_PNL_CACHE: dict[str, float] = {}   # key = symbol, value = 累计 real
 _LEDGER_FILE_NAME = "trade_ledger.json"
 _LEDGER_TRADING_DAY: str = ""           # 当前内存账本所属交易日
 _TODAY_OPEN_ACC: dict[str, list] = {}   # f"{sym}_{pos_dir}" → [Σ(价×量), Σ量]
+_PREV_MV_CACHE: dict = {"bd": "", "mv": {}}   # T-1 昨市值，按业务日缓存（T-1 收盘定值，日内不变）
 _BASIS_WARN_SIGNATURE: str = ""         # 上次基准告警签名，避免每轮 poll 刷日志
 
 
@@ -154,6 +155,70 @@ def _accum_open_cost(rec: dict) -> None:
 def _open_cost_map() -> dict:
     """今日开仓加权价 → calc_pnl 的 today_open_cost（key 与 {sym}_{direction} 对齐）。"""
     return {k: amt / vol for k, (amt, vol) in _TODAY_OPEN_ACC.items() if vol > 0}
+
+
+def _cash_flow_map() -> dict:
+    """今日成交净现金 {f"{sym}_{pos_dir}": 元}，买入为负、卖出为正。
+
+    当日盈亏 = 今日成交现金 + 今持仓市值 − 昨持仓市值。
+    用 position_direction 而非 direction：卖平多头那笔 direction=空、position_direction=多，
+    记错键同合约多空串账。
+    """
+    with _shared_lock:
+        contracts = _shared_state.get("contracts", {})
+    out: dict[str, float] = {}
+    for recs in _TRADE_CACHE.values():
+        for rec in recs:
+            sym = rec.get("symbol") or ""
+            px  = float(rec.get("price", 0) or 0)
+            vol = int(rec.get("volume", 0) or 0)
+            if not sym or px <= 0 or vol <= 0:
+                continue
+            size = float((contracts.get(sym) or {}).get("size", 1) or 1)
+            pk = f"{sym}_{rec.get('position_direction') or ''}"
+            amt = px * vol * size
+            out[pk] = out.get(pk, 0.0) + (-amt if rec.get("trade_side") == "long" else amt)
+    return out
+
+
+def _prev_market_value() -> dict:
+    """T-1 收盘持仓市值 {f"{sym}_{pos_dir}": 元}，多头正、义务仓负。
+
+    Mark 取 close_snapshot 的 leaves（14:55–15:00 算术平均，price_basis=close_avg），
+    手数与乘数取同一文件的 raw.positions（leaves 只有价没有量）。
+    无 T-1 快照 → {} → 当日盈亏只剩现金项（告警）。
+    """
+    bd = _business_date(datetime.datetime.now())
+    if _PREV_MV_CACHE["bd"] == bd:
+        return _PREV_MV_CACHE["mv"]
+    mv: dict[str, float] = {}
+    fname = _prev_trading_day_file(bd)
+    if not fname:
+        logger.warning(f"[_prev_market_value] 无 T-1（{bd}）收盘快照 → 昨市值按 0，当日盈亏只剩现金项")
+    else:
+        try:
+            with open(_snapshot_path(fname), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            leaves = data.get("leaves") or {}
+            for p in (data.get("raw") or {}).get("positions") or []:
+                sym = str(p.get("symbol") or "").split(".")[0]
+                dr = "long" if p.get("direction") in ("long", "多") else "short"
+                vol = abs(float(p.get("volume", 0) or 0))
+                size = float(p.get("size", 1) or 1)
+                if not sym or vol <= 0 or size <= 0:
+                    continue
+                leaf = leaves.get(f"{sym}_{dr}") or {}
+                if leaf.get("price_basis") != "close_avg":
+                    continue
+                mark = leaf.get("adjust_price")
+                if not isinstance(mark, (int, float)) or mark != mark or mark <= 0:
+                    continue
+                mv[f"{sym}_{dr}"] = (1 if dr == "long" else -1) * vol * size * float(mark)
+            logger.info(f"[_prev_market_value] {fname} → {len(mv)} 腿昨市值，合计 {sum(mv.values()):.2f}")
+        except Exception as e:
+            logger.warning(f"[_prev_market_value] 读 {fname} 失败: {e}")
+    _PREV_MV_CACHE["bd"], _PREV_MV_CACHE["mv"] = bd, mv
+    return mv
 
 
 def _replay_trade_record(rec: dict) -> None:
@@ -396,19 +461,26 @@ def _connect_engine(cred: dict):
 
 
 # ── P0-2/3/5: CTP 成交回报回调 ─────────────────────────────────────────────
-def _on_trade(trade) -> None:
+def _on_trade(event) -> None:
     """
     CTP 成交通知回调（P0-2/3/5 账本模型 + P0-6 realized_pnl）。
+
+    ⚠️ 入参是 vnpy 的 Event，载荷在 event.data —— 直接当 TradeData 取属性会恒得
+    空串，兜底 trade_id 退化成 "_0_0"，所有成交 dedup 成同一条被 _SEEN_TRADE_IDS 丢弃
+    （2026-09-28 实测：当日全部成交通报丢失，当日盈亏缺现金项）。
 
     幂等去重：同一 (trading_day, account, exchange, trade_id) 只处理一次。
     账本分组：ledger_key = (trading_day, account, exchange, symbol, position_direction)
     方向守恒：同一分组内的开仓/平仓记录共同参与 PnL 计算。
+
 
     归因优先级：
       1. CTP 原生 offset_flag（open / close_today / close_yesterday）
       2. 降级推断（无 offset_flag 时）：由 open_close 推断，并标注 allocation_source="fifo_fallback"
     """
     try:
+        # vnpy EventEngine 传 Event，载荷在 .data；兼容直接喂 TradeData 的调用方
+        trade = getattr(event, "data", event)
         dt_str = str(getattr(trade, 'datetime', '') or '')
         # 交易日以 CTP TradingDay 为权威（夜盘 21:00 的成交属下一业务日）
         # 取不到（未登录等）才退回成交自然日，仅作兜底
@@ -466,6 +538,12 @@ def _on_trade(trade) -> None:
 
         price = float(getattr(trade, 'price', 0) or 0)
         volume = int(getattr(trade, 'volume', 0) or 0)
+
+        # 坏条不入账：symbol/price/volume 缺一就是解析失败，落盘只会污染账本和已实现汇总
+        if not symbol or price <= 0 or volume <= 0:
+            logger.warning(f"[_on_trade] 丢弃坏条 symbol={symbol!r} price={price} volume={volume} "
+                           f"dedup={dedup_key}")
+            return
 
         record = {
             'dedup_key': dedup_key,
@@ -1164,17 +1242,17 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
     settlement_cost_dict  = settlement_data
     settlement_prices_dict = settlement_prices
 
-    # ── 加载昨快照（adjust_price）──────────────────────────────────────────────
-    # calc_pnl 期望格式: {f"{sym}_{direction}": {"adjust_price": float}}
-    # yesterday_snapshot key 已在 _load_yesterday_snapshot 中构建为英文
-    yesterday_snapshot = _load_yesterday_snapshot()
+    # ── 当日盈亏三段式的两段输入 ──────────────────────────────────────────────
+    # cash_flow = 今日成交净现金（账本），prev_mv = T-1 昨持仓市值（收盘快照）
+    cash_flow_map = _cash_flow_map()
+    prev_mv       = _prev_market_value()
 
     # ── 写共享状态 ────────────────────────────────────────────────────────────
     # build_tree 是纯函数，需要 ticks + contracts + settlement_dict
     try:
         tree = build_tree(positions_out, ticks, contracts,
-                          settlement_cost_dict, settlement_prices_dict,
-                          yesterday_snapshot, _RECEIVED_TODAY, _open_cost_map())
+                          settlement_cost_dict, _open_cost_map(),
+                          cash_flow_map, prev_mv)
     except Exception:
         import traceback
         tree = {"summary": {}, "tree": []}
@@ -1185,28 +1263,24 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             f.write(f"ticks={list(ticks.keys())[:10]}\n")
             f.write(traceback.format_exc())
             f.write("\n")
-    logger.info(f"[_poll_once] positions_out={len(positions_out)}, contracts={len(contracts)}, tree_nodes={len(tree.get('tree',[]))}, yesterday_snapshot_keys={len(yesterday_snapshot)}, settlement_prices_keys={len(settlement_prices_dict)}")
+    logger.info
 
-    # F1: 基准来源可见性——昨收盘快照以外的降级腿计数发生变化时告警一次（不每轮刷屏）
-    global _BASIS_WARN_SIGNATURE
-    _counts = (tree.get("summary") or {}).get("pnl_basis_counts") or {}
-    _sig = json.dumps(_counts, sort_keys=True)
-    if _sig != _BASIS_WARN_SIGNATURE:
-        _BASIS_WARN_SIGNATURE = _sig
-        _bad = {k: v for k, v in _counts.items() if k != "prev_close_snapshot"}
-        if _bad:
-            logger.warning(f"[pnl基准] 非昨收盘快照基准腿 计数={_bad}（快照基准 "
-                           f"{_counts.get('prev_close_snapshot', 0)} 腿）—— 见基线 §3.7 降级链")
+    # F1 基准告警已撤：当日盈亏改现金口径后 price_basis 恒为 cash_flow，
+    # 「非昨收盘快照基准腿」这个条件永不再有信息量。昨收降级链仍在 _prev_market_value 内部。
 
-    # P0-6: 汇总已实现 PnL（_realized_pnl_cache）追加到 summary
-    # 全平合约从 tree 消失，但其 realized PnL 必须进入当日和历史汇总
-    total_realized = sum(_REALIZED_PNL_CACHE.values())
-    if total_realized != 0:
-        if tree.get("summary"):
-            # _make_summary 的键名是 total_*，注入必须对齐，否则写进无人消费的野键
-            tree["summary"]["total_pnl_today"] = round(tree["summary"].get("total_pnl_today", 0) + total_realized, 2)
-            tree["summary"]["total_pnl_history"] = round(tree["summary"].get("total_pnl_history", 0) + total_realized, 2)
-        logger.debug(f"[_poll_once] realized_pnl accumulated: {total_realized:.2f}")
+    # 全平腿：合约已从 tree 消失，但今日现金已实现 —— 补进 total_pnl_today。
+    # 不能用 _REALIZED_PNL_CACHE：那是盯市口径的平仓收益，与现金口径重复，
+    # 且按 sym 汇总会把已配对平仓算两遍。现金口径下腿级已算过，这里只补没有腿的孤儿键。
+    if tree.get("summary"):
+        _live_keys = {f"{p['symbol'].split('.')[0]}_"
+                      f"{'long' if p.get('direction') in ('long', '多') else 'short'}"
+                      for p in positions_out}
+        _orphan = round(sum(v for k, v in cash_flow_map.items() if k not in _live_keys), 2)
+        if _orphan != 0:
+            tree["summary"]["total_pnl_today"] = round(
+                tree["summary"].get("total_pnl_today", 0) + _orphan, 2)
+        if _orphan:
+            logger.info(f"[_poll_once] 全平腿现金 { _orphan:.2f} 计入当日盈亏（无持仓腿）")
 
     with _shared_lock:
         _shared_state["positions"] = positions_out
@@ -1268,7 +1342,8 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         now_ts = time.time()
         f_rate = _compute_f_rate(underlying_prices, now_ts)
         iv_rate = _compute_iv_rate(by_underlying, option_greeks, now_ts)
-        burn = _compute_burn(positions_out, yesterday_snapshot)
+        # Burn 要的是昨收**价**（Premium Burn 分母），与 pnl_today 的昨市值是两回事 → 单独取快照
+        burn = _compute_burn(positions_out, _load_yesterday_snapshot())
         structure = _compute_structure(positions_out)
         # 合约代码 → 品种（前端所有变色/标记的统一键；MO→IM 等别名由 normalize_underlying 归一）
         cund = {}
