@@ -122,6 +122,23 @@ def tag_pnl(pnl: float) -> str:
 # =======================================================================
 # adjust_price
 # =======================================================================
+def clamp_to_quote(price: float, tick: dict) -> float:
+    """[bid, ask] 刚性约束：价出界时吸近侧（对称，2026-09-29 裁定）。
+
+    期货腿没有 ITM/OTM 阶梯、也不走 pricing 的四级路线，这是它唯一的区间约束。
+    无双边有效盘口（无挂单 / 交叉）→ 原样返回，区间此时无定义。
+    """
+    b = float(tick.get('bid_price_1') or 0)
+    a = float(tick.get('ask_price_1') or 0)
+    if b <= 0 or a <= b:
+        return price
+    if price < b:
+        return b
+    if price > a:
+        return a
+    return price
+
+
 def calc_adjust_price(tick: dict, contract: dict) -> float:
     """
     三级调整价（详见基线 §3.2）：
@@ -131,13 +148,13 @@ def calc_adjust_price(tick: dict, contract: dict) -> float:
     实现：当前统一用 last_price（或 pre_close 兜底）；ITM/OTM 三级精细化可在
           Worker 两阶段计算后回填 tick['adjust_price']，此处作为最终兜底。
     """
-    # 优先用 Worker（pricing.price_options_batch）预算的四级调整价
+    # 优先用 Worker（pricing.price_options_batch）预算的四级调整价（该路径自带 [bid,ask] 约束）
     adj = tick.get('adjust_price')
     if adj and adj > 0:
         return adj
     price = tick.get('last_price', 0)
     if price and price > 0:
-        return price
+        return clamp_to_quote(price, tick)
     return tick.get('pre_close', 0) or tick.get('prev_close', 0) or 0.0
 
 

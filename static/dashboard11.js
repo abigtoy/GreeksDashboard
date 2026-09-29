@@ -656,6 +656,7 @@ function renderSummary(s) {
   const posList = (State.snapshot && State.snapshot.positions) || [];
   for (const p of posList) {
     if (!p.option_type) continue; // 期货 option_type 为空
+    if (!(p.last_price > 0)) continue; // 后端已用昨收盘价兜底；仍无价 → 不计入，不猜
     const mv = (p.last_price || 0) * Math.abs(p.volume || 0) * (p.size || 0);
     netOptMv += p.direction === 'long' ? mv : -mv;
   }

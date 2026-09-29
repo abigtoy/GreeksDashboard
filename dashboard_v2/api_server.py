@@ -146,6 +146,8 @@ def _accum_open_cost(rec: dict) -> None:
     v = int(rec.get('volume', 0) or 0)
     if p <= 0 or v <= 0:
         return
+    if str(rec.get("trading_day") or "") != _LEDGER_TRADING_DAY:
+        return                      # 非 CTP 当日账本的成交不进今日开仓成本
     k = f"{rec.get('symbol')}_{rec.get('position_direction')}"
     acc = _TODAY_OPEN_ACC.setdefault(k, [0.0, 0])
     acc[0] += p * v
@@ -198,6 +200,8 @@ def _cash_flow_map() -> dict:
     out: dict[str, float] = {}
     for recs in _TRADE_CACHE.values():
         for rec in recs:
+            if str(rec.get("trading_day") or "") != _LEDGER_TRADING_DAY:
+                continue              # 只收 CTP 当日账本的成交
             sym = rec.get("symbol") or ""
             px  = float(rec.get("price", 0) or 0)
             vol = int(rec.get("volume", 0) or 0)
@@ -250,6 +254,85 @@ def _prev_market_value() -> dict:
     return mv
 
 
+_PREV_CLOSE_CACHE: dict = {"bd": "", "marks": {}, "underlying": {}}   # T-1 收盘切片，按业务日缓存
+
+
+def _t1_close(bd: str = None):
+    """T-1 收盘切片：({f"{sym}_{dr}": close_avg}, {full_und: 标的收盘})。
+
+    未开盘合约的统一口径：last 和 underlying 都取这里，命中不了就 0。
+    两条兜底读同一份 close_snapshot_{T-1}.json，不会一个有值一个空。
+    没开盘不等于没价值：MO/IF/IC/IO 跟随 CFFEX 日盘，夜盘不交易，CTP 不推 tick
+    → 置 0 会让义务仓市值在权益里消失（15 手 MO 曾少算 14 万），Greeks 也失去 F。
+    ponytail: 只认 close_avg（14:55-15:00 算术平均）；要改用昨结算价就改这一处。
+    """
+    bd = bd or _business_date(datetime.datetime.now())
+    if _PREV_CLOSE_CACHE["bd"] == bd:
+        return _PREV_CLOSE_CACHE["marks"], _PREV_CLOSE_CACHE["underlying"]
+    marks: dict[str, float] = {}
+    und_prices: dict[str, float] = {}
+    fname = _prev_trading_day_file(bd)
+    if fname:
+        try:
+            with open(_snapshot_path(fname), "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            for k, v in (snap.get("leaves") or {}).items():
+                if v.get("price_basis") != "close_avg":
+                    continue
+                m = v.get("adjust_price")
+                if isinstance(m, (int, float)) and m == m and m > 0:
+                    marks[k] = float(m)
+            for k, v in ((snap.get("raw") or {}).get("underlying_prices") or {}).items():
+                if isinstance(v, (int, float)) and v == v and v > 0:
+                    und_prices[k] = float(v)
+        except Exception as e:
+            logger.warning(f"[_t1_close] 读 {fname} 失败: {e}")
+    _PREV_CLOSE_CACHE["bd"], _PREV_CLOSE_CACHE["marks"], _PREV_CLOSE_CACHE["underlying"] = bd, marks, und_prices
+    return marks, und_prices
+
+
+_PREV_HELD_CACHE: dict = {"bd": "", "held": set()}   # T-1 真实有仓的腿，按业务日缓存
+
+
+def _prev_held_set() -> set:
+    """T-1 真实持有过的腿 {(sym, "long"/"short")}，volume != 0 才算。
+
+    CTP 对只报单未成交的合约也会在持仓里留一条 vol=0 的残影，得靠这个区分。
+    volume == 0 的不算——昨天就平光的，今天并未持有。
+    """
+    bd = _business_date(datetime.datetime.now())
+    if _PREV_HELD_CACHE["bd"] == bd:
+        return _PREV_HELD_CACHE["held"]
+    held: set = set()
+    fname = _prev_trading_day_file(bd)
+    if fname:
+        try:
+            with open(_snapshot_path(fname), "r", encoding="utf-8") as f:
+                raw = (json.load(f).get("raw") or {}).get("positions") or []
+            for x in raw:
+                if not abs(float(x.get("volume", 0) or 0)):
+                    continue
+                dr = "long" if x.get("direction") in ("long", "多") else "short"
+                held.add((str(x.get("symbol", "")).split(".")[0], dr))
+        except Exception as e:
+            logger.warning(f"[_prev_held_set] 读 {fname} 失败: {e}")
+    _PREV_HELD_CACHE["bd"], _PREV_HELD_CACHE["held"] = bd, held
+    return held
+
+
+def _ever_held(sym: str, direction: str) -> bool:
+    """这条腿曾经持有过吗？跨日平仓（昨有仓今全平）和当日往返都算，只报单不算。"""
+    if (sym, direction) in _prev_held_set():
+        return True
+    with _shared_lock:
+        cache = {k: list(v) for k, v in _TRADE_CACHE.items()}
+    for recs in cache.values():
+        for rec in recs:
+            if (rec.get("symbol"), rec.get("position_direction")) == (sym, direction):
+                return True
+    return False
+
+
 def _replay_trade_record(rec: dict) -> None:
     """从落盘记录重建内存账本（按 dedup_key 幂等）。"""
     dk = rec.get("dedup_key") or ""
@@ -299,11 +382,16 @@ def _load_trade_ledger(expected_day: str = "") -> None:
         return
     trades = data.get("trades") or []
     _reset_trade_state()
+    day = td or expected_day
+    _LEDGER_TRADING_DAY = day        # 先定日：_accum_open_cost 靠它过滤，重放后才设会滤光
+    kept = 0
     for rec in trades:
+        if day and str(rec.get("trading_day") or "") != day:
+            continue                  # 顶层 trading_day 匹配不够，逐条再校一次
         _replay_trade_record(rec)
-    _LEDGER_TRADING_DAY = td or expected_day
+        kept += 1
     if trades:
-        logger.info(f"[ledger] 重放 {len(trades)} 笔（交易日 {td}），已实现合计 {sum(_REALIZED_PNL_CACHE.values()):.2f}")
+        logger.info(f"[ledger] 重放 {kept}/{len(trades)} 笔（交易日 {day}），已实现合计 {sum(_REALIZED_PNL_CACHE.values()):.2f}")
 
 
 def _rollover_trading_day(td: str) -> None:
@@ -1020,6 +1108,9 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         else:
             und_contract = engine.get_contract(full_und)
             price = getattr(und_contract, "pre_close", 0) or 0.0
+            # 仍无价（IM 期货无夜盘 tick）→ 与期权腿同一份 T-1 收盘切片兜底
+            if not price:
+                price = _t1_close()[1].get(full_und, 0.0)
         underlying_prices[full_und] = price
 
     # ── 计算 Greeks ───────────────────────────────────────────────────────────
@@ -1081,8 +1172,12 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
                     "datetime":     getattr(tick, "datetime", None),
                 }
             else:
+                # 无行情（夜盘未开盘 / 盘前盘后）→ 用 T-1 收盘价兜底。
+                # 没开盘不等于没价值：置 0 会让义务仓市值在权益里消失。
+                _dr = "long" if pos.direction == Direction.LONG else "short"
+                _sym = pos.vt_symbol.split('.')[0]
                 option_ticks[pos.vt_symbol] = {
-                    "last_price":   0.0,
+                    "last_price":   _t1_close()[0].get(f"{_sym}_{_dr}", 0.0),
                     "bid_price_1":  0,
                     "ask_price_1":  0,
                     "bid_volume_1": 0,
@@ -1101,6 +1196,11 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             lp = ft.last_price or (getattr(ft, "pre_close", 0) or 0)
             ft_dt = getattr(ft, "datetime", None)
         sym = pos.vt_symbol.split('.')[0]
+        if not lp:
+            # 未开盘期货腿（IF/IC 无夜盘 tick）→ 与期权腿同一份 T-1 收盘切片兜底。
+            # 置 0 会让 deltacash 归零，并把成本当亏损（adjust_price=0 → pnl_history 假数）。
+            _dr = "long" if pos.direction == Direction.LONG else "short"
+            lp = _t1_close()[0].get(f"{sym}_{_dr}", 0.0)
         # 品种级标记：futures 的品种 = 合约主符号（如 CU/AU/NI/IM 期货品种）
         # 提取品种前缀：2字母（CU/AU/NI/IM 等）或 1字母（J/M/RU 等），数字前部分
         import re
@@ -1113,8 +1213,10 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
                 _RECEIVED_TODAY[species] = True
         option_ticks[pos.vt_symbol] = {
             "last_price":       lp,
-            "bid_price_1":      0,
-            "ask_price_1":      0,
+            "bid_price_1":      getattr(ft, "bid_price_1", 0) or 0,
+            "ask_price_1":      getattr(ft, "ask_price_1", 0) or 0,
+            "bid_volume_1":     getattr(ft, "bid_volume_1", 0) or 0,
+            "ask_volume_1":     getattr(ft, "ask_volume_1", 0) or 0,
             "underlying_price": lp,
             "iv":               None,
             "datetime":         ft_dt,
@@ -1164,6 +1266,10 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             direction = "short"
             pos_volume = -pos.volume
             available = -pos.available if pos.available else 0
+
+        # vol=0 有两种：跨日/当日平仓的真实持仓（要显示），只报单未成交的 CTP 残影（不显示）
+        if not pos_volume and not _ever_held(symbol.split('.')[0], direction):
+            continue
 
         # 开仓价：优先结算单
         settle_key = f"{symbol.split('.')[0]}_{('多' if direction == 'long' else '空')}"

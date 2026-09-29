@@ -259,102 +259,212 @@ finally:
     reset_cache()
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("== 5. 无行情 → pnl_today=None，且不影响账户汇总 ==")
+print("== 5. 当日盈亏现金口径（2026-09-28 定案：cash + 今市值 − 昨市值）==")
 import datetime as _dt                              # noqa: E402
 from dashboard_v2 import risk_engine as R           # noqa: E402
 
-pos_if = {"symbol": "IF2609", "direction": "long",  "volume": 2, "price": 4500.0}
-pos_ic = {"symbol": "IC2612", "direction": "short", "volume": 1, "price": 7000.0}
-contracts = {"IF2609": {"size": 300}, "IC2612": {"size": 200}}
-ticks = {"IF2609": {"last_price": 4550.0, "datetime": _dt.datetime.now()}}   # IC2612 无 tick
-settle_cost = {"IF2609_long": 4400.0}
-settle_px = {"IF2609": 4460.8}
-recv = {"IF2609": True, "IC2612": True}
+# 5a 夜盘门禁：夜盘窗口内无夜盘时段的品种（MO/IF/IC/IO…）当日盈亏强制 0
+# 注意门禁比对的是 normalize_underlying(sym)：MO→IM 走 CFFEX_MAP，故传 "IM"
+_mo_pos = {"symbol": "MO2610-P-7500", "direction": "short", "volume": 2, "price": 129.0}
+_mo_con = {"MO2610-P-7500": {"size": 100, "option_type": "看跌期权", "strike": 7500,
+                             "days_to_expiry": 20}}
+_mo_tick = {"last_price": 129.0, "underlying_price": 7400.0, "iv": 0.25,
+            "datetime": _dt.datetime.now()}
+_mo_cash = {"MO2610-P-7500_short": 25800.0}          # 平 2 手 @129 卖出
+_mo_prev = {"MO2610-P-7500_short": -24000.0}        # 昨 2 手 @120 义务仓市值
 
-# 5a tick 缺失 → None
-r = R.calc_pnl(pos_ic, contracts["IC2612"], {}, settle_cost, settle_px, None, recv)
-check("无 tick → pnl_today=None", r["pnl_today"] is None, str(r))
-check("无 tick → price_basis=no_tick / pnl_history=0（不留陈旧值）",
-      r["price_basis"] == "no_tick" and r["pnl_history"] == 0.0, str(r))
+_r_gated = R.calc_pnl_today("MO2610-P-7500_short", -1, 2, 100, 129.0, _mo_cash, _mo_prev)
+check("calc_pnl_today 手算 = 25,800 + (−25,800) − (−24,000) = 24,000", _r_gated == 24000.0, str(_r_gated))
 
-# 5b 有 tick 但是往日报价（重连后 vnpy 缓存）→ None
-stale = {"last_price": 4550.0, "datetime": _dt.datetime.now() - _dt.timedelta(days=1)}
-r = R.calc_pnl(pos_if, contracts["IF2609"], stale, settle_cost, settle_px, None, recv)
-check("陈旧缓存价（非今日 datetime）→ pnl_today=None", r["pnl_today"] is None, str(r))
+_t_gated = R.build_tree([_mo_pos], {"MO2610-P-7500": _mo_tick}, _mo_con, {},
+                        None, _mo_cash, _mo_prev, night_gated={"IM"})
+_t_open = R.build_tree([_mo_pos], {"MO2610-P-7500": _mo_tick}, _mo_con, {},
+                       None, _mo_cash, _mo_prev, night_gated=set())
+_n_gated = _t_gated["tree"][0]["children"][0]["children"][0]
+_n_open = _t_open["tree"][0]["children"][0]["children"][0]
+check("夜盘门禁生效 → pnl_today=0 且 price_basis=not_open",
+      _n_gated["pnl_today"] == 0.0 and _n_gated["price_basis"] == "not_open", str(_n_gated))
+check("门禁非摆设：同一腿不门禁时出 24,000（去掉门禁即 2.4 万假盈亏）",
+      _n_open["pnl_today"] == 24000.0 and _n_open["price_basis"] == "cash_flow", str(_n_open))
 
-# 5c 有今日 tick 但无基准（今仓）→ None
-r = R.calc_pnl(pos_ic, contracts["IC2612"], {"last_price": 7000.0, "datetime": _dt.datetime.now()},
-               {}, {}, None, recv)
-check("有 tick 无基准（今仓）→ pnl_today=None", r["pnl_today"] is None, str(r))
+# 5b 多头正常路径：0 + 2×300×4550 − 2,640,000 = 90,000
+_r = R.calc_pnl_today("IF2609_long", 1, 2, 300, 4550.0, {"IF2609_long": 0.0},
+                      {"IF2609_long": 2640000.0})
+check("多头含昨市值 = 90,000", _r == 90000.0, str(_r))
 
-# 5d 正常路径仍出数
-r = R.calc_pnl(pos_if, contracts["IF2609"], ticks["IF2609"], settle_cost, settle_px, None, recv)
-check("正常路径 pnl_today=53520", r["pnl_today"] == 53520.0, str(r))
+# 5c 昨市值缺失 → 只剩现金项（告警降级，不静默编造）
+_r_no = R.calc_pnl_today("MO2610-P-7500_short", -1, 2, 100, 129.0, {}, {})
+_r_yes = R.calc_pnl_today("MO2610-P-7500_short", -1, 2, 100, 129.0, {}, {"MO2610-P-7500_short": -24000.0})
+check("无昨市值 → 全额 −25,800；有昨市值 → −1,800",
+      _r_no == -25800.0 and _r_yes == -1800.0, f"{_r_no} / {_r_yes}")
 
-# 5e 汇总不因 None 行受污染
-tree = R.build_tree([pos_if, pos_ic], ticks, contracts, settle_cost, settle_px, None, recv)
-rows = {n["symbol"]: n for l1 in tree["tree"] for l2 in l1["children"] for n in l2["children"]}
-check("L3：IF2609 有值 / IC2612 为 None",
-      rows["IF2609"]["pnl_today"] == 53520.0 and rows["IC2612"]["pnl_today"] is None,
-      f"IF={rows['IF2609']['pnl_today']} IC={rows['IC2612']['pnl_today']}")
-check("total_pnl_today = 仅有效行之和（None 不累加）",
-      tree["summary"]["total_pnl_today"] == 53520.0, str(tree["summary"]["total_pnl_today"]))
+# 5d vol=0 当日往返：开 2 手 @120 卖、平 2 手 @129 买回 → 净现金 +1,800，仍须显示
+_r = R.calc_pnl_today("MO2610-P-7500_short", -1, 0, 100, 0.0,
+                      {"MO2610-P-7500_short": 1800.0}, {})
+check("vol=0 当日往返 → pnl_today=1,800（cash 净额，不被 vol 抹掉）", _r == 1800.0, str(_r))
+
+# 5e 逐级可加：各级 = 各腿之和，无摊派
+_pos = [{"symbol": "IF2609", "direction": "long", "volume": 2, "price": 4500.0},
+        {"symbol": "IC2612", "direction": "short", "volume": 1, "price": 7000.0},
+        {"symbol": "MO2610-P-7500", "direction": "short", "volume": 2, "price": 129.0}]
+_con = {"IF2609": {"size": 300}, "IC2612": {"size": 200}, **_mo_con}
+_tick = {"IF2609": {"last_price": 4550.0}, "IC2612": {"last_price": 7000.0},
+         "MO2610-P-7500": _mo_tick}
+_cash = {"IF2609_long": 0.0, "IC2612_short": 0.0, "MO2610-P-7500_short": 25800.0}
+_prev = {"IF2609_long": 2640000.0, "IC2612_short": -1400000.0, "MO2610-P-7500_short": -24000.0}
+_tree = R.build_tree(_pos, _tick, _con, {}, None, _cash, _prev)
+_l3 = [n["pnl_today"] for l1 in _tree["tree"] for l2 in l1["children"] for n in l2["children"]]
+_l2 = [l2["metrics"]["pnl_today"] for l1 in _tree["tree"] for l2 in l1["children"]]
+_l1 = [l1["metrics"]["pnl_today"] for l1 in _tree["tree"]]
+check("L3 逐腿（按品种序 IC/IF/MO）：0 / 90,000 / 24,000",
+      _l3 == [0.0, 90000.0, 24000.0], str(_l3))
+check("L2 = 各 L3 之和", all(abs(a - b) < 0.01 for a, b in zip(_l2, _l3)), str(_l2))
+check("L1 = 各 L2 之和", all(abs(a - b) < 0.01 for a, b in zip(_l1, _l2)), str(_l1))
+check("summary.total_pnl_today = Σ 各腿（无摊派）",
+      _tree["summary"]["total_pnl_today"] == 114000.0 and _tree["summary"]["position_count"] == 3,
+      f"{_tree['summary']['total_pnl_today']} / {_tree['summary']['position_count']}")
 
 # 5f 快照/响应里不再出现 NaN 字面量（严格 JSON 可解析）
-blob = json.dumps(A._clean_nan(tree), ensure_ascii=False, allow_nan=False)
+blob = json.dumps(A._clean_nan(_tree), ensure_ascii=False, allow_nan=False)
 check("严格 JSON 序列化通过且无 NaN", "NaN" not in blob, "")
 
 # ===========================================================================
-# 6. 今开仓腿基准 + 成交账本持久化（2026-09-18 定案：今开按开仓价）
+# 6. 开仓成本三档链 + 成交账本持久化（当日盈亏已移出 calc_pnl）
 # ===========================================================================
-print("== 6. 今开仓腿基准 / 成交账本落盘重放 ==")
-import datetime as _dt2  # noqa: E402
+print("== 6. 开仓成本链 / 账本落盘重放 / 业务日过滤 ==")
 
-_t = {"last_price": 4478.2, "adjust_price": 4478.2, "datetime": _dt2.datetime.now()}
-_p = {"symbol": "IF2610", "direction": "long", "volume": 8, "price": 4464.0}
-_c = {"IF2610": {"size": 300}}
+_c6 = {"IF2609": {"size": 300}}
+_t6 = {"last_price": 4550.0, "adjust_price": 4550.0, "datetime": _dt.datetime.now()}
+_p6 = {"symbol": "IF2609", "direction": "long", "volume": 2, "price": 4500.0}
 
-# 6a 今开腿（无昨收/昨结）→ 基准=账本开仓价
-_r = R.calc_pnl(_p, _c["IF2610"], _t, {}, {}, None, {"IF2610": True}, {"IF2610_long": 4464.0})
-check("今开腿基准=开仓价（IF2609 平昨 73,968 + IF2610 今开 34,080 ≈ 老系统 108,500）",
-      abs(_r["pnl_today"] - 34080.0) < 1 and _r["price_basis"] == "today_open_cost", str(_r))
+# 6a 结算单开仓均价优先
+_r = R.calc_pnl(_p6, _c6["IF2609"], _t6, {"IF2609_long": 4400.0}, None)
+check("成本档一：结算单 4400 → pnl_history=90,000 / settlement_cost",
+      _r["cost_basis"] == "settlement_cost" and _r["pnl_history"] == 90000.0, str(_r))
 
-# 6b 昨结存在 + 今开 → 昨结为准并标 mixed（单一基准无法拆分今昨手数）
-_r = R.calc_pnl(_p, _c["IF2610"], _t, {}, {"IF2610": 4460.8}, None, {"IF2610": True},
-                {"IF2610_long": 4464.0})
-check("昨结+今开 → 标 today_open_mixed 待核",
-      _r["price_basis"] == "prev_settlement_fallback+today_open_mixed", str(_r))
+# 6b 结算单缺 → 今日账本开仓价
+_r = R.calc_pnl(_p6, _c6["IF2609"], _t6, {}, {"IF2609_long": 4464.0})
+check("成本档二：账本 4464 → 51,600 / ledger_open_cost",
+      _r["cost_basis"] == "ledger_open_cost" and _r["pnl_history"] == 51600.0, str(_r))
 
-# 6c 期权今开（CTP position.price=0）→ 成本取账本开仓价，不留 -30,775 假数
-_p2 = {"symbol": "MO2610-P-7500", "direction": "short", "volume": -2, "price": 0.0}
-_t2 = {"last_price": 129.8, "adjust_price": 129.0, "datetime": _dt2.datetime.now()}
-_r = R.calc_pnl(_p2, {"size": 100}, _t2, {}, {}, None, {"MO2610-P-7500": True},
-                {"MO2610-P-7500_short": 129.0})
-check("期权今开成本取账本开仓价（无 position.price 假数）",
-      _r["cost_basis"] == "ledger_open_cost" and _r["pnl_history"] == 0.0, str(_r))
+# 6c 两档都缺 → CTP 持仓均价
+_r = R.calc_pnl(_p6, _c6["IF2609"], _t6, {}, {})
+check("成本档三：CTP 持仓均价 4500 → 30,000 / position_price",
+      _r["cost_basis"] == "position_price" and _r["pnl_history"] == 30000.0, str(_r))
 
-# 6d 账本落盘 → 重放 → 切日清零
+# 6d vol=0 → closed，不留陈旧浮盈
+_r = R.calc_pnl({"symbol": "IF2609", "direction": "long", "volume": 0, "price": 4500.0},
+                _c6["IF2609"], _t6, {"IF2609_long": 4400.0}, None)
+check("vol=0 → closed / pnl_history=0",
+      _r == {"pnl_history": 0.0, "cost_price": 0.0, "cost_basis": "closed"}, str(_r))
+
+# 6e 期权今开：CTP position.price=0 时成本落到账本开仓价，不留 0 假数
+_p6o = {"symbol": "MO2610-P-7500", "direction": "short", "volume": 2, "price": 0.0}
+_r = R.calc_pnl(_p6o, _mo_con["MO2610-P-7500"], _mo_tick, {}, {"MO2610-P-7500_short": 120.0})
+check("期权今开 position.price=0 → 账本成本 120 / pnl_history=−1,800（空头涨 9 点亏）",
+      _r["cost_basis"] == "ledger_open_cost" and _r["pnl_history"] == -1800.0, str(_r))
+
+# ── 6f/6g/6h：账本业务日过滤（2026-09-29 修复）───────────────────────────
+# 根因：_load_trade_ledger / _cash_flow_map / _accum_open_cost 漏 trading_day 过滤，
+#       21:00 后 CTP 已切下一交易日，历史账本里的旧成交混进当日现金项（污染 1,227,740）。
 _tmpdir = tempfile.mkdtemp(prefix="ledger_")
-_old_dir, _old_day = A._SNAPSHOT_DIR, A._LEDGER_TRADING_DAY
+_saved = (A._SNAPSHOT_DIR, A._LEDGER_TRADING_DAY, dict(A._shared_state.get("contracts") or {}),
+          A._TRADE_CACHE, A._SEEN_TRADE_IDS, A._REALIZED_PNL_CACHE, A._TODAY_OPEN_ACC)
 A._SNAPSHOT_DIR = _tmpdir
+A._shared_state["contracts"] = {"IF2609": {"size": 300}, "IC2612": {"size": 200}}
 A._reset_trade_state()
-A._LEDGER_TRADING_DAY = "20260918"
-A._replay_trade_record({"dedup_key": "20260918_CTP_CFFEX_1",
-                        "ledger_key": ["20260918", "CTP", "CFFEX", "IF2609", "long"],
-                        "trade_id": "1", "symbol": "IF2609", "position_direction": "long",
-                        "offset_flag": "close_yesterday", "price": 4491.62, "volume": 8,
-                        "realized_pnl": 73968.0})
+
+
+def _rec(day, sym, direction, side, offset, px, vol, pnl, tid):
+    return {"dedup_key": f"{day}_CTP_CFFEX_{tid}", "ledger_key": [day, "CTP", "CFFEX", sym, direction],
+            "trading_day": day, "trade_id": str(tid), "symbol": sym,
+            "position_direction": direction, "trade_side": side, "offset_flag": offset,
+            "price": px, "volume": vol, "realized_pnl": pnl}
+
+
+_today, _stale = "20260929", "20260928"
+A._LEDGER_TRADING_DAY = _today
+A._replay_trade_record(_rec(_today, "IF2609", "long", "long", "open", 4464.0, 8, 1000.0, 1))
+A._replay_trade_record(_rec(_stale, "IC2612", "short", "short", "open", 7000.0, 1, 999999.0, 2))
+check("_accum_open_cost 业务日过滤：只收当日开仓，昨日期不进",
+      list(A._TODAY_OPEN_ACC.keys()) == ["IF2609_long"], str(A._TODAY_OPEN_ACC))
+
+A._reset_trade_state()
+A._LEDGER_TRADING_DAY = _today
+for _r0 in (_rec(_today, "IF2609", "long", "short", "close_today", 4550.0, 8, 0.0, 1),
+            _rec(_stale, "IC2612", "short", "short", "close_today", 7100.0, 1, 0.0, 2)):
+    A._TRADE_CACHE.setdefault(tuple(_r0["ledger_key"]), []).append(_r0)
+_cf = A._cash_flow_map()
+check("_cash_flow_map 业务日过滤：IC2612 昨日期 71 万不进当日现金",
+      _cf == {"IF2609_long": 8 * 300 * 4550.0}, str(_cf))
+
+# 落盘 → 重置 → 重放：_LEDGER_TRADING_DAY 必须先于重放赋值，否则当日记录被滤光
+A._reset_trade_state()
+A._LEDGER_TRADING_DAY = _today
+A._replay_trade_record(_rec(_today, "IF2609", "long", "long", "open", 4464.0, 8, 1000.0, 1))
+A._replay_trade_record(_rec(_stale, "IC2612", "short", "short", "open", 7000.0, 1, 999999.0, 2))
 A._save_trade_ledger()
 A._reset_trade_state()
 A._LEDGER_TRADING_DAY = ""
-A._load_trade_ledger("20260918")
-check("重启重放：已实现 73,968 不归零",
-      abs(A._REALIZED_PNL_CACHE.get("IF2609", 0) - 73968.0) < 0.01, str(A._REALIZED_PNL_CACHE))
-A._rollover_trading_day("20260919")
-check("切日（CTP TradingDay）→ 账本清零",
-      not A._REALIZED_PNL_CACHE and A._LEDGER_TRADING_DAY == "20260919", "")
-A._SNAPSHOT_DIR, A._LEDGER_TRADING_DAY = _old_dir, _old_day
+A._load_trade_ledger(_today)
+check("_load_trade_ledger 逐条过滤：只重放 1 笔，已实现 1,000（99.9 万假账被挡住）",
+      A._REALIZED_PNL_CACHE == {"IF2609": 1000.0}, str(A._REALIZED_PNL_CACHE))
+check("重放时 _LEDGER_TRADING_DAY 已定 → 当日开仓成本进账（4464）",
+      A._open_cost_map() == {"IF2609_long": 4464.0}, str(A._open_cost_map()))
+
+# 切日（CTP TradingDay）→ 清零
+A._rollover_trading_day("20260930")
+check("切日 → 账本清零且 _LEDGER_TRADING_DAY=20260930",
+      not A._REALIZED_PNL_CACHE and A._LEDGER_TRADING_DAY == "20260930",
+      f"{A._REALIZED_PNL_CACHE} {A._LEDGER_TRADING_DAY}")
+
+# 账本顶层日 ≠ CTP TradingDay → 整本丢弃（昨日账由结算单接管）
 A._reset_trade_state()
+A._LEDGER_TRADING_DAY = _stale
+A._replay_trade_record(_rec(_stale, "IC2612", "short", "short", "open", 7000.0, 1, 999999.0, 2))
+A._save_trade_ledger()
+A._reset_trade_state()
+A._LEDGER_TRADING_DAY = ""
+A._load_trade_ledger(_today)
+check("账本日(20260928) ≠ 交易日(20260929) → 整本丢弃，99.9 万不进当日",
+      not A._REALIZED_PNL_CACHE and A._LEDGER_TRADING_DAY == _today, str(A._REALIZED_PNL_CACHE))
+
+# 6i T-1 收盘兜底：一条口径，marks + underlying 读同一份 snapshot
+_shots = tempfile.mkdtemp(prefix="prevclose_")
+_saved2 = (A._SNAPSHOT_DIR, A._prev_trading_day_file, A._PREV_CLOSE_CACHE)
+A._SNAPSHOT_DIR = _shots
+with open(os.path.join(_shots, "close_snapshot_T1.json"), "w", encoding="utf-8") as _f:
+    json.dump({"leaves": {
+        "MO2610-P-7500_short": {"adjust_price": 120.0, "price_basis": "close_avg"},
+        "IF2609_long":         {"adjust_price": 4444.0, "price_basis": "last"},
+        "IC2609_long":         {"adjust_price": -1.0,  "price_basis": "close_avg"},
+    }, "raw": {"underlying_prices": {
+        "IM2610.CFFEX": 7316.0, "IF2609.CFFEX": 0, "BAD.CFFEX": "x",
+    }}}, _f)
+A._prev_trading_day_file = lambda bd: "close_snapshot_T1.json"
+A._PREV_CLOSE_CACHE = {"bd": "", "marks": {}, "underlying": {}}
+_marks, _unds = A._t1_close()
+check("_t1_close marks 只收 close_avg，拒 price_basis=last 与非正价",
+      _marks == {"MO2610-P-7500_short": 120.0}, str(_marks))
+check("_t1_close 读 raw.underlying_prices 作期权 F，拒非数值/非正价",
+      _unds == {"IM2610.CFFEX": 7316.0}, str(_unds))
+check("未开盘腿兜底：命中拿 T-1 收盘 7316.0，miss 归零不抛异常（一致性口径）",
+      _marks.get("IF2609_long", 0.0) == 0.0
+      and _unds.get("IF2609.CFFEX", 0.0) == 0.0
+      and _unds.get("IM2610.CFFEX", 0.0) == 7316.0)
+# 按业务日缓存：同 bd 二次调用不再读文件；换 bd 才重载
+A._PREV_CLOSE_CACHE = {"bd": "", "marks": {}, "underlying": {}}
+A._prev_trading_day_file = lambda bd: "close_snapshot_MISSING.json"
+check("_t1_close 换业务日重载，snapshot 缺失时两半都空（不抛）",
+      A._t1_close("20260101") == ({}, {}) and A._t1_close("20260101") == ({}, {}))
+A._SNAPSHOT_DIR, A._prev_trading_day_file, A._PREV_CLOSE_CACHE = _saved2
+
+# 还原
+A._SNAPSHOT_DIR, A._LEDGER_TRADING_DAY = _saved[0], _saved[1]
+A._shared_state["contracts"] = _saved[2]
+A._TRADE_CACHE, A._SEEN_TRADE_IDS = _saved[3], _saved[4]
+A._REALIZED_PNL_CACHE, A._TODAY_OPEN_ACC = _saved[5], _saved[6]
 shutil.rmtree(_tmpdir, ignore_errors=True)
+shutil.rmtree(_shots, ignore_errors=True)
 
 print(f"\nPASS {ok} 项")

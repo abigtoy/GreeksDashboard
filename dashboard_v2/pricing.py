@@ -185,9 +185,20 @@ def _model_in_bracket(leg, s, ref_iv, b, a):
         return a, tag + '_ask'
     return p, tag
 
+def _bracket(b, a):
+    """双边都挂单却 a<=b（交叉/畸形）时区间无定义，整条按无盘口处理。
+    单边挂单要保留——它不成价，只当模型价的界。"""
+    if b > 0 and a > 0 and a <= b:
+        return (0.0, 0.0)
+    return (b, a)
+
 def _adjust_otm(leg, s, ref_iv=None):
-    """阶梯 1/2/4（OTM 或正常腿）。返回 (价, basis)；价 0 = 无可用价，交调用方兜底。"""
+    """阶梯 1/2/4（OTM 或正常腿）。返回 (价, basis)；价 0 = 无可用价，交调用方兜底。
+
+    [bid, ask] 是无条件最底层约束（基线 §0.3）：只要存在双边有效盘口，返回值必落在其中。
+    """
     n, b, a = _live(leg)
+    b, a = _bracket(b, a)
     if b <= 0 and a <= 0:
         return (n, 'last') if n > 0 else (0.0, 'none')
     if b <= 0 or a <= 0:
@@ -200,15 +211,18 @@ def _adjust_otm(leg, s, ref_iv=None):
     spread = abs(a - b)
     mid = _mid(b, a)
     sr = spread / mid if mid > 0 else 1.0
-    # 盘口内 + 紧价差 → 用最新价
-    if n > 0 and b <= n <= a and sr <= _SPREAD_TIGHT_THRESHOLD:
-        return n, 'last'
+    # 紧价差 → 用最新价；出界则吸近侧（对称，仍属 last 族，不是退档二模型价）
+    if n > 0 and sr <= _SPREAD_TIGHT_THRESHOLD:
+        if b <= n <= a:
+            return n, 'last'
+        return (b, 'last_clamp_bid') if n < b else (a, 'last_clamp_ask')
     # 价差过宽：旧版退中间价，改为参考 IV 模型价夹进盘口
     return _model_in_bracket(leg, s, ref_iv, b, a)
 
 def _adjust_itm(leg, s, k, cp, all_legs, ref_iv=None):
     """阶梯3：深度实值 PCP 平价。OTM 腿价格嵌套 _adjust_otm。缺对手腿 → 参考 IV 模型价。"""
     _, b, a = _live(leg)
+    b, a = _bracket(b, a)
     otm = next((t for t in all_legs
                 if t.get('cp') == -cp and abs((t.get('strike') or 0) - k) < 0.01), None)
     if otm is None:
@@ -529,6 +543,34 @@ if __name__ == "__main__":
     adjE, basisE = _adjust_otm(legE, s=2200.0, ref_iv=0.20)
     assert basisE == 'last' and abs(adjE - 55.0) < 0.01, f"TestE failed: {adjE}/{basisE}"
     print(f"  Last=55∈[50,60]+spread≤20% → mark={adjE:.2f} (basis={basisE}) ✓")
+    # Test H: last 出界但盘口可信 → 吸近侧（对称，2026-09-29 裁定，仍属 last 族）
+    legH1 = dict(legE, last_price=45.0)
+    adjH1, basisH1 = _adjust_otm(legH1, s=2200.0, ref_iv=0.20)
+    assert basisH1 == 'last_clamp_bid' and adjH1 == 50.0, f"TestH1 failed: {adjH1}/{basisH1}"
+    legH2 = dict(legE, last_price=70.0)
+    adjH2, basisH2 = _adjust_otm(legH2, s=2200.0, ref_iv=0.20)
+    assert basisH2 == 'last_clamp_ask' and adjH2 == 60.0, f"TestH2 failed: {adjH2}/{basisH2}"
+    print(f"  last=45<bid50 → 吸 bid {adjH1} ({basisH1}) / last=70>ask60 → 吸 ask {adjH2} ({basisH2}) ✓")
+    # Test H3: 价差过宽时仍退模型价夹盘口（吸近侧不得越过"盘口可信"前提）
+    legH3 = {'last_price': 45.0, 'bid_price_1': 1.0, 'ask_price_1': 200.0,
+             'datetime': dt.now(), 'strike': 2200.0, 'cp': -1, 'ttm': _T}
+    adjH3, basisH3 = _adjust_otm(legH3, s=2200.0, ref_iv=0.20)
+    assert 1.0 <= adjH3 <= 200.0, f"TestH3 出界: {adjH3}/{basisH3}"
+    print(f"  宽价差 bid1/ask200 → 退模型价 mark={adjH3:.2f} (basis={basisH3}) 仍∈[bid,ask] ✓")
+    # Test H4: 交叉盘口 a<=b → 区间无定义，按无盘口处理走 last
+    legH4 = dict(legE, bid_price_1=80.0, ask_price_1=70.0)
+    adjH4, basisH4 = _adjust_otm(legH4, s=2200.0, ref_iv=0.20)
+    assert basisH4 == 'last' and adjH4 == 55.0, f"TestH4 failed: {adjH4}/{basisH4}"
+    print(f"  交叉盘口 bid80/ask70 → 不成区间 → last {adjH4} ({basisH4}) ✓")
+    # Test H5: 期货腿 [bid,ask] 刚性约束（risk_engine.clamp_to_quote，无 ITM/OTM 阶梯）
+    from dashboard_v2.risk_engine import clamp_to_quote as _cq
+    assert _cq(45.0, {'bid_price_1': 50.0, 'ask_price_1': 60.0}) == 50.0
+    assert _cq(70.0, {'bid_price_1': 50.0, 'ask_price_1': 60.0}) == 60.0
+    assert _cq(55.0, {'bid_price_1': 50.0, 'ask_price_1': 60.0}) == 55.0
+    assert _cq(55.0, {'bid_price_1': 0, 'ask_price_1': 0}) == 55.0        # 无盘口
+    assert _cq(55.0, {'bid_price_1': 60.0, 'ask_price_1': 50.0}) == 55.0  # 交叉
+    assert _cq(55.0, {'bid_price_1': 50.0, 'ask_price_1': 0}) == 55.0     # 单边
+    print("  期货腿 clamp：出界吸近侧 / 盘口内不变 / 无·交叉·单边盘口原样 ✓")
     # Test F: 参考 IV 提炼 —— put 取 K<F 最大、call 取 K>F 最小，中间的腿不参与
     pool = [{'strike': 2000.0, 'cp': -1, 'last_price': 90.0, 'ttm': _T},     # 更虚 value 的 put，不参与
             {'strike': 2150.0, 'cp': -1, 'last_price': 62.0, 'ttm': _T},     # K<F 最大 put ✓
