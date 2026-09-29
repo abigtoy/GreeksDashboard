@@ -43,7 +43,8 @@ check("price 键=纯 symbol（无方向后缀）", all("_" not in k or "-" in k 
 check("cost 键={sym}_{long|short}", all(k.endswith(("_long", "_short")) for k in costs), str(list(costs)[:2]))
 check("方向已归一为英文", not any(k.endswith(("_多", "_空")) for k in costs))
 check("结算价有正数", any(v > 0 for v in prices.values()))
-check("meta.latest 为最近有效结算单", latest == "20260917", latest)
+_full_dates = sorted(f[5:-5] for f in os.listdir(SETTLE_DIR) if f.startswith("full_") and f.endswith(".json"))
+check("meta.latest 为最近有效结算单", latest == _full_dates[-1], f"{latest} vs {_full_dates[-1]}")
 check("_is_valid_settlement(真结算单)=True", S._is_valid_settlement(full_path))
 check("_valid_dates 含 latest", latest in S._valid_dates(), str(sorted(S._valid_dates())))
 

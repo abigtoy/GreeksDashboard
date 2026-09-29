@@ -157,6 +157,35 @@ def _open_cost_map() -> dict:
     return {k: amt / vol for k, (amt, vol) in _TODAY_OPEN_ACC.items() if vol > 0}
 
 
+def _night_gated_products() -> set:
+    """夜盘窗口内、当日盈亏强制 0 的品种集合（= 没有夜盘时段的那些）。
+
+    夜盘窗口沿用 _current_session 的 'N'（20:00-24:00 / 00:00-02:30）；
+    窗口外返回空集 → 所有腿走正常现金口径，午休/盘后不受影响。
+    夜盘时段取自 config/trading_hours.csv（起点 >= 20:00 的段）：有夜盘的
+    品种（au/ag/cu/sc/…）不在集合内，夜盘照常累计盈亏。
+    """
+    if _current_session(datetime.datetime.now())[0] != "N":
+        return set()
+    from dashboard_v2.alert_config import load_trading_hours
+    gated = set()
+    for prod, row in load_trading_hours().items():
+        sessions = row.get("sessions") or []
+        if not sessions:
+            continue                      # 查不到时段 → 放行，不误杀
+        has_night = False
+        for span in sessions:
+            try:
+                if int(str(span).split("-")[0].strip().split(":")[0]) >= 20:
+                    has_night = True
+                    break
+            except (ValueError, IndexError):
+                continue
+        if not has_night:
+            gated.add(prod)
+    return gated
+
+
 def _cash_flow_map() -> dict:
     """今日成交净现金 {f"{sym}_{pos_dir}": 元}，买入为负、卖出为正。
 
@@ -1246,13 +1275,15 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
     # cash_flow = 今日成交净现金（账本），prev_mv = T-1 昨持仓市值（收盘快照）
     cash_flow_map = _cash_flow_map()
     prev_mv       = _prev_market_value()
+    # 没开盘就没有盈亏：夜盘窗口内、无夜盘时段的品种（IF/IC/IM/MO…）强制 0
+    night_gated   = _night_gated_products()
 
     # ── 写共享状态 ────────────────────────────────────────────────────────────
     # build_tree 是纯函数，需要 ticks + contracts + settlement_dict
     try:
         tree = build_tree(positions_out, ticks, contracts,
                           settlement_cost_dict, _open_cost_map(),
-                          cash_flow_map, prev_mv)
+                          cash_flow_map, prev_mv, night_gated)
     except Exception:
         import traceback
         tree = {"summary": {}, "tree": []}
@@ -1275,7 +1306,10 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         _live_keys = {f"{p['symbol'].split('.')[0]}_"
                       f"{'long' if p.get('direction') in ('long', '多') else 'short'}"
                       for p in positions_out}
-        _orphan = round(sum(v for k, v in cash_flow_map.items() if k not in _live_keys), 2)
+        # 同 _build_l3_node 的门：没开盘的品种，其孤儿现金也不能计
+        _orphan = round(sum(v for k, v in cash_flow_map.items()
+                            if k not in _live_keys
+                            and normalize_underlying(k.split("_")[0]) not in night_gated), 2)
         if _orphan != 0:
             tree["summary"]["total_pnl_today"] = round(
                 tree["summary"].get("total_pnl_today", 0) + _orphan, 2)

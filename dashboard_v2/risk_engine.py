@@ -310,7 +310,8 @@ def build_tree(positions: list, ticks: dict, contracts: dict,
                settlement_dict: dict,
                today_open_cost: dict = None,
                cash_flow: dict = None,
-               prev_mv: dict = None) -> dict:
+               prev_mv: dict = None,
+               night_gated: set = None) -> dict:
     """
     构建 L1→L2→L3 嵌套树。
     返回: { summary, tree }
@@ -335,7 +336,8 @@ def build_tree(positions: list, ticks: dict, contracts: dict,
             l3_nodes = []
             for pos in product_map[product][month]:
                 node = _build_l3_node(pos, ticks, contracts, settlement_dict,
-                                      today_open_cost, cash_flow, prev_mv)
+                                      today_open_cost, cash_flow, prev_mv,
+                                      night_gated)
                 if node:
                     l3_nodes.append(node)
                     # L3 只进 L2，L1 汇总在 L2→L1 阶段做（避免 L1 双计）
@@ -461,7 +463,8 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
                    settlement_dict: dict,
                    today_open_cost: dict = None,
                    cash_flow: dict = None,
-                   prev_mv: dict = None) -> dict | None:
+                   prev_mv: dict = None,
+                   night_gated: set = None) -> dict | None:
     sym      = pos['symbol'].split('.')[0]
     contract = contracts.get(sym, {})
     tick     = ticks.get(sym, {})
@@ -476,10 +479,17 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
     pos_key = f"{sym}_{direction_str}"
 
     pnl = calc_pnl(pos, contract, tick_with_adj, settlement_dict, today_open_cost)
-    pnl_today = calc_pnl_today(
-        pos_key, 1 if direction_str == 'long' else -1,
-        abs(pos.get('volume', 0) or 0), contract.get('size', 1) or 1,
-        adj_price, cash_flow or {}, prev_mv or {})
+    # 没开盘就没有盈亏：夜盘窗口内、没有夜盘时段的品种（IF/IC/IM/MO/IO…）
+    # 此时无 tick → adj_price 拿不到 → 今市值算成 0，公式只剩 −昨市值，
+    # 编出上千万假亏。这类腿当日盈亏强制 0，不进现金口径。
+    gated = normalize_underlying(sym) in (night_gated or ())
+    if gated:
+        pnl_today = 0.0
+    else:
+        pnl_today = calc_pnl_today(
+            pos_key, 1 if direction_str == 'long' else -1,
+            abs(pos.get('volume', 0) or 0), contract.get('size', 1) or 1,
+            adj_price, cash_flow or {}, prev_mv or {})
 
     # ITM 判断
     itm = False
@@ -525,7 +535,7 @@ def _build_l3_node(pos: dict, ticks: dict, contracts: dict,
         "thetacash": g.get('thetacash', 0),
         "pnl_today":   pnl_today,
         "pnl_history": pnl.get('pnl_history', 0),
-        "price_basis": "cash_flow",
+        "price_basis": "not_open" if gated else "cash_flow",
         "cost_basis":  pnl.get('cost_basis', 'n/a'),
         "delta_tag": tag_delta(g.get('deltacash', 0)),
         "gamma_tag": tag_gamma(g.get('gammacash', 0)),
