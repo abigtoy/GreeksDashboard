@@ -395,7 +395,24 @@ async function fetchDashboard() {
 }
 
 // ─── 监控预警：toast 弹窗 + 告警记录弹窗 ────────────────────────────────────
-const _seenAlertIds = new Set();     // 前端去重：同一 popup 只弹一次
+// 前端去重：读取 sessionStorage，页面刷新不重弹
+function _loadSeenAlertIds() {
+  try {
+    const raw = sessionStorage.getItem('seen_alert_ids');
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+function _saveSeenAlertId(key) {
+  try {
+    const s = _loadSeenAlertIds();
+    s.add(key);
+    // 保留最多 300 条
+    const arr = Array.from(s).slice(-300);
+    sessionStorage.setItem('seen_alert_ids', JSON.stringify(arr));
+  } catch (e) {}
+}
 
 // 合约代码 → 品种（后端 contract_und 为权威，MO→IM 等别名由后端归一；缺失时按去分隔符/数字兜底）
 function undOf(code) {
@@ -407,13 +424,24 @@ function undOf(code) {
 
 function handleAlerts(snap) {
   if (!snap) return;
-  // 1) 弹窗（后端已做冷却/计数，这里只负责展示 + 前端去重）
+  // 1) 弹窗（后端已做冷却/计数，这里只负责展示 + 前端去重 + 后端 ACK）
   const popups = snap.popups || [];
+  const seen = _loadSeenAlertIds();
+  const ackKeys = [];
   for (const p of popups) {
     const key = p.alert_id + '|' + p.ts;
-    if (_seenAlertIds.has(key)) continue;
-    _seenAlertIds.add(key);
+    ackKeys.push(key);
+    if (seen.has(key)) continue;
+    _saveSeenAlertId(key);
     showAlertToast(p);
+  }
+  // 向后端 ACK 清除已处理的 popups 队列
+  if (ackKeys.length > 0) {
+    fetch('/api/alert/popups/ack', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: ackKeys })
+    }).catch(() => {});
   }
   // 2) 告警记录弹窗若开着 → 实时刷新
   const modal = document.getElementById('alert-list-modal');
@@ -424,13 +452,18 @@ function showAlertToast(p) {
   const box = document.getElementById('alert-toasts');
   if (!box) return;
   const div = document.createElement('div');
-  div.className = 'alert-toast ' + (p.level === 'danger' ? 'danger' : 'warn');
+  const lvClass = p.level === 'danger' ? 'danger' : (p.level === 'normal' ? 'normal' : 'warn');
+  div.className = 'alert-toast ' + lvClass;
   div.innerHTML = `<span>${p.msg}</span><span class="toast-close">✕</span>`;
   div.querySelector('.toast-close').addEventListener('click', ev => { ev.stopPropagation(); div.remove(); });
   div.addEventListener('click', () => openAlertList());
   box.appendChild(div);
   // 最多同时挂 6 条，超出丢弃最旧的
   while (box.children.length > 6) box.removeChild(box.firstChild);
+  // 恢复类 (normal) 弹窗 6 秒后自动渐隐关闭
+  if (p.level === 'normal') {
+    setTimeout(() => { if (div.parentNode) div.remove(); }, 6000);
+  }
 }
 
 // ─── 告警记录弹窗（时间排序 / 等级筛选 / 品种筛选）──────────────────────────
@@ -814,10 +847,19 @@ function buildL3Row(l3, l2Key) {
               : c.col === 'pnl_today'        ? (_ad.burn    || {})[_und]
               : null;
     const aCls = aLv === 'danger' ? 'alert-danger' : aLv === 'warn' ? 'alert-warn' : '';
+    // 静默失败哨兵：调整价与最新价不一致 = 定价阶梯真的走了（PCP/模型价/夹盘口）。
+    // 一致 = 报价原样透传。若全看板长期无任何突出显示，说明报价被静默清零
+    // （曾因 aware/naive 时区相减抛错 → _live() 归零 → IV 全组同值）。
+    // 叶子节点无 option_type 字段，用 iv 非空识别期权腿（期货 iv 为 null）。
+    const adjDiff = c.col === 'adjust_price'
+                 && l3.iv !== null && l3.iv !== undefined
+                 && l3.adjust_price && l3.last_price
+                 && Math.abs(l3.adjust_price - l3.last_price) > 1e-9
+                 ? ' adj-diff' : '';
     // 数字列默认右对齐；文本列默认左对齐
     const defAlign = isNumCol(c.col) ? 'right' : 'left';
     const align = c.align ? `text-align:${c.align==='R'?'right':'left'};` : `text-align:${defAlign};`;
-    const cls    = [numCls, tagCls, pnlC, aCls].filter(Boolean).join(' ');
+    const cls    = [numCls, tagCls, pnlC, aCls].join(' ') + adjDiff;
 
     html += `<td class="${cls}" style="${align}">${fmt(v, null, c.fmt, c.pct)}</td>`;
   }

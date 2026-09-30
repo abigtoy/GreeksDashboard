@@ -199,6 +199,10 @@ tr.alert-danger > td.tree-cell { border-left: 3px solid #ef4444; }
 /* 告警单元格变色（F→标的价、IV→IV%、Burn→当日盈亏） */
 td.alert-warn   { background: rgba(251,191,36,0.16) !important; box-shadow: inset 0 0 0 1px rgba(251,191,36,0.55); }
 td.alert-danger { background: rgba(239,68,68,0.20) !important; box-shadow: inset 0 0 0 1px rgba(239,68,68,0.65); }
+/* 静默失败哨兵：调整价≠最新价 = 定价阶梯真的走了。
+   全看板长期无此高亮 → 报价被静默清零，IV 会退化成组内同值。 */
+td.adj-diff     { color: #a78bfa !important; font-weight: 600;
+                  box-shadow: inset 0 0 0 1px rgba(167,139,250,0.5); }
 /* 风险度数字块（账户级 Margin） */
 .summary-item .value.alert-warn   { background: rgba(251,191,36,0.16) !important; color: #fbbf24 !important; border-radius: 4px; }
 .summary-item .value.alert-danger { background: rgba(239,68,68,0.20) !important; color: #ef4444 !important; border-radius: 4px; }
@@ -220,6 +224,7 @@ td.alert-danger { background: rgba(239,68,68,0.20) !important; box-shadow: inset
 .alert-toast { padding: 10px 14px; border-radius: 6px; color: #fff; font-size: 13px; box-shadow: 0 4px 14px rgba(0,0,0,0.4); display: flex; align-items: flex-start; gap: 10px; }
 .alert-toast.warn   { background: #b45309; border-left: 4px solid #fbbf24; }
 .alert-toast.danger { background: #991b1b; border-left: 4px solid #ef4444; }
+.alert-toast.normal { background: #166534; border-left: 4px solid #22c55e; }
 .alert-toast .toast-close { cursor: pointer; font-weight: 700; opacity: .8; margin-left: auto; }
 .alert-toast .toast-close:hover { opacity: 1; }
 /* 告警历史 */

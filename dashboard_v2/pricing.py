@@ -158,6 +158,10 @@ def _is_stale(dt):
         from datetime import datetime as _d
         if isinstance(dt, str):
             dt = _d.strptime(dt.split('.')[0], '%Y-%m-%d %H:%M:%S')
+        # CTP tick.datetime 带 tzinfo(Asia/Shanghai)，now() 是 naive，
+        # 直接相减抛 TypeError → 被下面 except 吞掉 → 全部期权腿误判陈旧、报价清零。
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
         return (_d.now() - dt).total_seconds() / 60.0 > _STALE_MINUTES
     except Exception:
         return True

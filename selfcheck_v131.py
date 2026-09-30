@@ -467,4 +467,23 @@ A._REALIZED_PNL_CACHE, A._TODAY_OPEN_ACC = _saved[5], _saved[6]
 shutil.rmtree(_tmpdir, ignore_errors=True)
 shutil.rmtree(_shots, ignore_errors=True)
 
+# ── 回归：aware/naive 时区相减（曾致全部期权腿误判陈旧 → IV 退化为组内同值）──
+import datetime                                          # noqa: E402
+from dashboard_v2 import pricing as P                     # noqa: E402
+from vnpy_ctp.gateway.ctp_gateway import CHINA_TZ        # noqa: E402
+_now = datetime.datetime.now()
+_aware = _now.replace(tzinfo=CHINA_TZ)          # CTP tick.datetime 带 tzinfo
+check("_is_stale 处理 aware tick（Asia/Shanghai）：新鲜不判陈旧",
+      P._is_stale(_aware) is False)
+check("_is_stale 处理 naive tick：新鲜不判陈旧",
+      P._is_stale(_now) is False)
+check("_is_stale 保留陈旧语义：aware 超 3 分钟仍判陈旧",
+      P._is_stale((_now - datetime.timedelta(minutes=5)).replace(tzinfo=CHINA_TZ)) is True)
+check("_is_stale(None) 仍判陈旧（未开盘兜底腿）",
+      P._is_stale(None) is True)
+check("_live 不再清零 aware 行情（曾返回全 0）",
+      P._live({"last_price": 185.6, "bid_price_1": 0, "ask_price_1": 0,
+               "datetime": _aware})[0] == 185.6)
+
+
 print(f"\nPASS {ok} 项")

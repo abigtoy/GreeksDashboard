@@ -1945,12 +1945,13 @@ _F_HOURS_FALLBACK = 4.0                          # trading_hours.csv 查不到�
 
 
 def _level_of(value, warn, danger):
-    """值与阈值比较 → 'danger' | 'warn' | None"""
+    """值（可为正负，取其绝对值）与阈值比较 → 'danger' | 'warn' | None"""
     if value is None:
         return None
-    if danger is not None and value >= danger:
+    val_abs = abs(value)
+    if danger is not None and val_abs >= danger:
         return "danger"
-    if warn is not None and value >= warn:
+    if warn is not None and val_abs >= warn:
         return "warn"
     return None
 
@@ -2008,10 +2009,11 @@ def _conv_delta(symbol, F, K, days):
 
 def _compute_f_rate(underlying_prices, now_ts):
     """
-    合约级 F 速率 = ln(5min窗口内该合约最高/最低) / (σ_ref × √(5min/年))。
+    合约级 F 速率 = (ln(最新价/最早价)) / (σ_ref × √(5min/年))。
+    带正负符号：上涨为正（暴涨），下跌为负（暴跌）。
     按月份合约分别计算（RU2611/RU2612 各自独立窗口，跨月价差不互相污染）；
     σ_ref / 交易时长仍是品种级配置。
-    返回 {sym: (rate, 窗口最低价, 窗口最高价)}，sym 如 RU2611。
+    返回 {sym: (rate, 窗口最早价, 窗口最新价)}，sym 如 RU2611。
     """
     import math
     samples = _shared_state.setdefault("_f_samples", {})
@@ -2031,17 +2033,17 @@ def _compute_f_rate(underlying_prices, now_ts):
             dq.popleft()
         if len(dq) < 2:
             continue
-        lo = min(v for _, v in dq)
-        hi = max(v for _, v in dq)
-        if lo <= 0 or hi <= lo:
+        p_start = dq[0][1]
+        p_end = dq[-1][1]
+        if p_start <= 0 or p_end <= 0 or p_start == p_end:
             continue
         scale = _sigma_of(und) * math.sqrt(
             5.0 / (_F_RATE_ANNUAL_DAYS * 60.0 * _hours_of(und))
         )
         if scale <= 0:
             continue
-        # (速率, 窗口最低, 窗口最高) —— 两端值与告警值严格一致
-        out[sym] = (math.log(hi / lo) / scale, lo, hi)
+        # (带符号速率, 窗口最早价, 窗口最新价)
+        out[sym] = (math.log(p_end / p_start) / scale, p_start, p_end)
     return out
 
 
@@ -2081,10 +2083,11 @@ def _atm_iv_of_group(pos_list, option_greeks):
 
 def _compute_iv_rate(by_underlying, option_greeks, now_ts):
     """
-    合约级 ATM IV 速率 = (5min窗口 IV 极差) / σ_ref，5min 滚动窗口。
+    合约级 ATM IV 速率 = (5min窗口当前IV - 窗口起始IV) / σ_ref，5min 滚动窗口。
+    带正负符号：升水/暴涨为正，骤降/贴水为负。
     按月份合约分别计算（SC2611/SC2612 各自独立窗口，互不平滑）；
-    单位 = 百分数（值 5.0 即 5%）；断档 >4h 清空。
-    返回 {sym: (rate, 窗口低点, 窗口高点)}，sym 如 SC2611（月键 = 标的期货合约代码）。
+    单位 = 百分数（值 +5.0 即 +5%）；断档 >4h 清空。
+    返回 {sym: (rate, 窗口起始IV, 窗口当前IV)}，sym 如 SC2611（月键 = 标的期货合约代码）。
     """
     per_sym = {}   # {期货合约代码如 SC2611: 当前 ATM IV}
     for (und_raw, expiry), pos_list in (by_underlying or {}).items():
@@ -2116,14 +2119,13 @@ def _compute_iv_rate(by_underlying, option_greeks, now_ts):
         # 剔除 >5min 的过期样本
         while dq and (now_ts - dq[0][0]) > _IV_WINDOW_SEC:
             dq.popleft()
-        # 5min 窗口 H/L（采样仍是秒级）
+        # 5min 窗口 起始 / 最新
         if len(dq) >= 2:
-            vals = [v for _, v in dq]
-            lo, hi = min(vals), max(vals)
-            if lo > 0:
-                # 口径：5min IV 极差占 σ_ref 的比例，用百分数表示（值 5.0 = 5%）
-                #   iv 是百分数、σ_ref 是小数 → (hi-lo)/σ_ref 即百分号上的数字
-                out[sym] = ((hi - lo) / _sigma_of(und), lo, hi)
+            iv_start = dq[0][1]
+            iv_end = dq[-1][1]
+            if iv_start > 0 and iv_end > 0 and iv_start != iv_end:
+                # 口径：5min IV 净位移占 σ_ref 的比例，带符号百分数（值 5.0 = 5%）
+                out[sym] = ((iv_end - iv_start) / _sigma_of(und), iv_start, iv_end)
     return out
 
 
@@ -2208,7 +2210,8 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
     返回本轮应弹窗的 popups 列表。
     """
     _replay_alert_state()   # 启动后首轮：回放落盘的 prev_active / alert_state / alerts
-    today = datetime.datetime.fromtimestamp(now_ts).strftime("%Y%m%d")
+    # 判定当天必须使用业务交易日（与 CTP/系统业务日严格对齐，夜盘跨零点不割裂）
+    today = _shared_state.get("trading_day") or _business_date(datetime.datetime.fromtimestamp(now_ts))
     events = []   # (source, symbol, value, level, threshold)
     if _ALERT_WARMUP:
         _ALERT_WARMUP = False
@@ -2298,10 +2301,14 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
         # 最简格式：{类型} {对象}: {值}，{低点→报警点}（仅移动量类有尾段）；背景色已表达级别，无红黄字样/阈值
         if source == "f_rate":
             tail = f"，{p0:.0f}→{p1:.0f}" if p0 is not None and p1 is not None else ""
-            msg = f"F_rate {symbol}: {value:.2f}{tail}"
+            sign_str = f"+{value:.2f}" if value > 0 else f"{value:.2f}"
+            action = "暴涨" if value > 0 else "暴跌"
+            msg = f"F_{action} {symbol}: {sign_str}倍{tail}"
         elif source == "iv_rate":
             tail = f"，{p0:.2f}→{p1:.2f}" if p0 is not None and p1 is not None else ""
-            msg = f"IV {symbol}: {value:.2f}{tail}"
+            sign_str = f"+{value:.2f}" if value > 0 else f"{value:.2f}"
+            action = "飙升" if value > 0 else "骤降"
+            msg = f"IV_{action} {symbol}: {sign_str}%{tail}"
         elif source == "burn":
             msg = f"Burn {symbol}: {value:.2f}"
         elif source == "conv_delta":
@@ -2321,8 +2328,12 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
         if should:
             popups.append(rec)
     # 消除事件：prev_active 中本轮消失的 warn/danger → normal（连续 3 采样正常才解除）
+    # 规则：速率类指标（f_rate, iv_rate）为瞬时运动量，平抑后不报恢复；恢复提醒仅限阈值类指标（conv_delta, margin, burn）
     normal_counts = _shared_state.setdefault("normal_counts", {})
     for key, lv in list(prev_active.items()):
+        source_key = key.split("|", 1)[0]
+        if source_key in ("f_rate", "iv_rate"):
+            continue
         if key in cur_active or lv not in ("warn", "danger"):
             # 仍触发 → 重置连续正常计数
             if key in normal_counts:
@@ -2353,12 +2364,20 @@ def _evaluate_alerts(f_rate, iv_rate, burn, structure, contract_und, margin_stat
                     st["count"] += 1
                     st["last_popup"] = now_ts
                     should = True
+        if source == "margin":
+            recovery_msg = "保证金风险率已恢复正常"
+        elif source == "conv_delta":
+            recovery_msg = f"{symbol} Δ已脱离风险区"
+        elif source == "burn":
+            recovery_msg = f"{symbol} 权利金消耗已恢复正常"
+        else:
+            recovery_msg = f"{symbol} 已恢复正常"
         rec = {
             "alert_id": alert_id,
             "ts": datetime.datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S"),
             "source": source, "level": "normal", "symbol": symbol, "underlying": und,
             "value": None, "v_from": None, "v_to": None,
-            "threshold": None, "msg": f"{symbol} 已恢复正常", "popup": should,
+            "threshold": None, "msg": recovery_msg, "popup": should,
         }
         hist.append(rec)
         if should:
@@ -2789,6 +2808,19 @@ def create_app(settlement_dir: str = "结算单", static_folder=None, template_f
             return jsonify({"error": "invalid payload"}), 400
         saved = _save_alerts(patch_data)
         return jsonify({"ok": True, "settings": saved})
+
+    @app.route("/api/alert/popups/ack", methods=["POST"])
+    def _ack_alert_popups():
+        """前端消费弹窗后的确认清除接口。"""
+        req = request.get_json(silent=True) or {}
+        keys = set(req.get("keys") or [])
+        if keys:
+            with _shared_lock:
+                buf = _shared_state.get("popups", [])
+                _shared_state["popups"] = [
+                    p for p in buf if f"{p.get('alert_id')}|{p.get('ts')}" not in keys
+                ]
+        return jsonify({"ok": True})
 
     @app.route("/api/sigma_ref")
     def _get_sigma_ref():
