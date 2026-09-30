@@ -167,7 +167,7 @@ def _night_gated_products() -> set:
     夜盘时段取自 config/trading_hours.csv（起点 >= 20:00 的段）：有夜盘的
     品种（au/ag/cu/sc/…）不在集合内，夜盘照常累计盈亏。
     """
-    if _current_session(datetime.datetime.now())[0] != "N":
+    if _current_session(_now())[0] != "N":
         return set()
     from dashboard_v2.alert_config import load_trading_hours
     gated = set()
@@ -221,7 +221,7 @@ def _prev_market_value() -> dict:
     手数与乘数取同一文件的 raw.positions（leaves 只有价没有量）。
     无 T-1 快照 → {} → 当日盈亏只剩现金项（告警）。
     """
-    bd = _business_date(datetime.datetime.now())
+    bd = _business_date(_now())
     if _PREV_MV_CACHE["bd"] == bd:
         return _PREV_MV_CACHE["mv"]
     mv: dict[str, float] = {}
@@ -266,7 +266,7 @@ def _t1_close(bd: str = None):
     → 置 0 会让义务仓市值在权益里消失（15 手 MO 曾少算 14 万），Greeks 也失去 F。
     ponytail: 只认 close_avg（14:55-15:00 算术平均）；要改用昨结算价就改这一处。
     """
-    bd = bd or _business_date(datetime.datetime.now())
+    bd = bd or _business_date(_now())
     if _PREV_CLOSE_CACHE["bd"] == bd:
         return _PREV_CLOSE_CACHE["marks"], _PREV_CLOSE_CACHE["underlying"]
     marks: dict[str, float] = {}
@@ -300,7 +300,7 @@ def _prev_held_set() -> set:
     CTP 对只报单未成交的合约也会在持仓里留一条 vol=0 的残影，得靠这个区分。
     volume == 0 的不算——昨天就平光的，今天并未持有。
     """
-    bd = _business_date(datetime.datetime.now())
+    bd = _business_date(_now())
     if _PREV_HELD_CACHE["bd"] == bd:
         return _PREV_HELD_CACHE["held"]
     held: set = set()
@@ -419,6 +419,55 @@ def _ctp_trading_day() -> str:
     except Exception:
         pass
     return ""
+
+
+# ── 服务器时间（业务判定的唯一时间源）────────────────────────────────────────
+# 规则：系统内业务时间以 CTP 服务器时间为准，不以本机墙钟为准；
+#       CTP 离线时降级本机时间。随用随取，不做高频轮询。
+# 偏移来源：CTP 登录只给 TradingDay（日期）没有时刻，且无「查服务器时刻」接口
+#   （CtpMdApi 仅 login/logout/qryInstrument，CtpTdApi 全部 req* 里也没有），
+#   所以偏移只能由 tick 时间戳反推：offset = tick.datetime - 收到时的本机时刻。
+# 采集：_poll_once 每轮更新一次（不逐 tick，避免抖动）。丢弃：非 connected 即清空。
+# 业务日仍以 _ctp_trading_day() 为权威 —— tick 的 ActionDay 在夜盘跨零点后是
+#   下一交易日、UpdateTime 是 00:xx，拼接值算业务日会错；TradingDay 不会。
+_TIME_OFFSET: "datetime.timedelta | None" = None
+_TIME_OFFSET_MAX_AGE = 30.0    # tick 滞后超此秒数视为无行情，降级本机时间
+_LAST_LOGGED_OFFSET = "unset"  # 上次打进日志的偏移，只在变化时打
+
+
+def _now() -> datetime.datetime:
+    """服务器时间 = 本机时间 + 偏移；CTP 离线/无行情时降级本机时间。"""
+    if _TIME_OFFSET is None:
+        return datetime.datetime.now()
+    return datetime.datetime.now() + _TIME_OFFSET
+
+
+def _sync_time_offset(tick_dt) -> None:
+    """用最新 tick 时间戳矫正偏移。tick_dt 为 None 或陈旧 → 丢弃偏移（降级本机）。"""
+    global _TIME_OFFSET
+    if not tick_dt:
+        _TIME_OFFSET = None
+        return
+    try:
+        # CTP tick 带 Asia/Shanghai 的 tzinfo，但它存的是当地墙上时间；
+        # 这里只去 tzinfo，不做 astimezone()（那会按运行环境本地时区再平移一次）。
+        if tick_dt.tzinfo is not None:
+            tick_dt = tick_dt.replace(tzinfo=None)
+        lag = (datetime.datetime.now() - tick_dt).total_seconds()
+        # 只单向判陈旧：服务器比本机快正是要修正的场景，不能当异常丢掉
+        if lag > _TIME_OFFSET_MAX_AGE:
+            _TIME_OFFSET = None             # 行情停更（收盘/无夜盘）→ 降级
+            return
+        _TIME_OFFSET = tick_dt - datetime.datetime.now()
+    except Exception:
+        _TIME_OFFSET = None
+
+
+def _drop_time_offset() -> None:
+    """CTP 断开：偏移立即丢弃，业务时间降级本机。"""
+    global _TIME_OFFSET
+    _TIME_OFFSET = None
+
 
 # ── P0-8: 开盘合约标记（事件驱动：收到 tick 即标记）────────────────────────────
 _OPENED_CONTRACTS: dict[str, dict] = {}  # key = symbol, value = {first_tick: "HH:MM:SS"}
@@ -762,7 +811,9 @@ def _worker_loop(settlement_dir: str):
     """
 
     # === 时间守卫：非交易时段休眠，不建任何会话 ===
-    now = datetime.datetime.now()
+    # 服务器时间（CTP 在线时）。注意：守卫在连 CTP 之前，此时偏移必为 None
+    # → 降级本机时间，这是规则允许的唯一例外（无服务器时间可用）。
+    now = _now()
     weekday = now.weekday()   # Mon=0, Sun=6
     cur_min = now.hour * 60 + now.minute
     is_trading = weekday < 5   # 周一到周五
@@ -820,7 +871,7 @@ def _worker_loop(settlement_dir: str):
         if not _settlement_manager._meta.get("loaded", False):
             return False
         
-        now = datetime.datetime.now()
+        now = _now()
         if now.hour * 60 + now.minute >= _SYNC_GATE_MIN:
             if not _today_settlement_present():
                 return False
@@ -861,7 +912,7 @@ def _worker_loop(settlement_dir: str):
         - 每 _SYNC_RETRY_SEC 秒重试一次，直到当天文件入库
         - 已有 sync 在跑则不重复起线程
         """
-        now = datetime.datetime.now()
+        now = _now()
         if now.hour * 60 + now.minute < _SYNC_GATE_MIN:
             return
         
@@ -888,8 +939,8 @@ def _worker_loop(settlement_dir: str):
     attempts = 0
     disconnect_retry_count = 0   # 记录连续掉线次数（用于自动重连上限）
     while not _ctp_stop_event.is_set():
-        # 时间守卫：交易日前夜 04:00–08:20 不连接
-        now = datetime.datetime.now()
+        # 时间守卫：交易日前夜 04:00–08:20 不连接（重连阶梯循环内，CTP 在线时用服务器时间）
+        now = _now()
         weekday = now.weekday()
         cur_min = now.hour * 60 + now.minute
         if weekday < 5 and 4 * 60 <= cur_min < 8 * 60 + 20:
@@ -973,6 +1024,14 @@ def _worker_loop(settlement_dir: str):
                     logger.exception("[_poll_once] 异常")
                     import traceback
                     logger.info(f"[_poll_once] traceback: {traceback.format_exc()}")
+
+                # ★ 对侧腿按需订阅（深度实值 PCP 用）：**必须放在 _poll_once 之后** ——
+                # 首次订阅会阻塞，不能占交易轮询时延；落在 _close_snapshot_step + wait 间隙
+                try:
+                    _ensure_counter_subscriptions(eng)
+                except Exception:
+                    logger.exception("[counter-legs] 异常")
+
                 _close_snapshot_step()
                 _ctp_stop_event.wait(1.0)
             continue  # 回到外层重连阶梯
@@ -1012,9 +1071,62 @@ def _worker_loop(settlement_dir: str):
     _engine = None
 
 
+_COUNTER_SUBSCRIBED: set = set()   # 已订阅的对侧腿 vt_symbol，去重用
+_COUNTER_GROUP: dict = {}          # (und, expiry) -> [对侧腿 tick dict]，供 PCP 取用
+
+
+def _ensure_counter_subscriptions(engine):
+    """深实值持仓腿 → 按需订阅同 K 对侧腿行情（供 PCP 平价用）。
+
+    刻意放在主循环而非 _poll_once：首次订阅会阻塞（engine.query_ticks 内部 sleep），
+    不能占交易轮询时延。稳态下 wanted == 已订阅，只做集合运算，零阻塞。
+    门槛取 |Δ| > _ITM_DELTA_GATE 由 pricing 侧判定；这里订阅范围略宽（见 ITM 即订），
+    多订的是轻微实值腿，数量个位数，换取订阅判断留在单一位置。
+    """
+    if _shared_state.get("ctp_status") != "connected":
+        return
+    wanted = {}
+    for pos in (engine.query_positions() or []):
+        contract = engine.get_contract(pos.vt_symbol)
+        if not contract or contract.product != Product.OPTION:
+            continue
+        und = contract.option_underlying or ""
+        k = contract.option_strike or 0
+        if not und or k <= 0:
+            continue
+        cp = 1 if (contract.name or "").rfind("C") > (contract.name or "").rfind("P") else -1
+        # 标的期货价：读 _poll_once 写好的共享缓存，绝不在这里 query_tick（可能触发订阅阻塞）
+        s = _shared_state.get("underlying_prices", {}).get(f"{und}.{contract.exchange.value}", 0) or 0
+        if s <= 0:
+            continue
+        is_itm = (cp == 1 and s > k) or (cp == -1 and s < k)
+        if not is_itm:
+            continue
+        # 对侧腿：同标的、同到期、同行权价、反向 C/P
+        opp_cp = "C" if cp == -1 else "P"
+        k_int = int(k) if float(k).is_integer() else k
+        opp_vt = f"{und}-{opp_cp}{k_int}.{contract.exchange.value}"
+        expiry = str(contract.option_expiry)[:10] if contract.option_expiry else ""
+        wanted.setdefault((und, expiry), []).append(opp_vt)
+
+    new_vts = set()
+    for vts in wanted.values():
+        new_vts.update(v for v in vts if v not in _COUNTER_SUBSCRIBED)
+    _COUNTER_GROUP.clear()
+    _COUNTER_GROUP.update(wanted)          # 供 _poll_once 读取（纯读缓存，不订阅）
+    if not new_vts:
+        return
+    try:
+        engine.query_ticks(list(new_vts))
+        _COUNTER_SUBSCRIBED.update(new_vts)
+        logger.info(f"[counter-legs] 新订阅对侧腿 {len(new_vts)} 张: {sorted(new_vts)}")
+    except Exception as e:
+        logger.warning(f"[counter-legs] 对侧腿订阅失败: {type(e).__name__}: {e}")
+
+
 def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dict):
     """单次轮询：读取持仓 → 订阅行情 → 计算 Greeks → 写共享状态"""
-    global _engine, _RECEIVED_TODAY_DATE, _RECEIVED_TODAY, _SEEN_NONEMPTY_POS
+    global _engine, _RECEIVED_TODAY_DATE, _RECEIVED_TODAY, _SEEN_NONEMPTY_POS, _LAST_LOGGED_OFFSET
     _engine = engine
 
     # ── P0-8 补充：交易日切换 → 重置 received_today ────────────────────────────
@@ -1131,6 +1243,19 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             pdict = {"volume": pos.volume}
             option_symbols.append((pos.vt_symbol, cdict, pdict, direction_str))
 
+    # ── 服务器时间偏移采集 ────────────────────────────────────────────────────
+    # 复用本轮已取的 tick（不额外查询、不新增定时器）：顺带记下最新 ts，循环后统一矫正。
+    _latest_ts = [None]   # 单元素 list 避免 for 内写 nonlocal
+
+    def _note_ts(d):
+        """记下最新的 tick 时间戳（只去 tzinfo 比较，不 astimezone：那是 Asia/Shanghai 墙上时间）"""
+        if d is None:
+            return
+        k = d.replace(tzinfo=None) if d.tzinfo else d
+        cur = _latest_ts[0]
+        if cur is None or k > (cur.replace(tzinfo=None) if cur.tzinfo else cur):
+            _latest_ts[0] = d
+
     # 构造 option_ticks: {vt_symbol: {last_price, bid_price_1, ask_price_1, underlying_price, iv}}
     option_ticks = {}
     for (und, expiry), pos_list in by_underlying.items():
@@ -1149,6 +1274,7 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
                 # P0-8: 事件驱动开盘标记（收到 tick = 开盘）
                 sym = pos.vt_symbol.split('.')[0]
                 ts = getattr(tick, 'datetime', None)
+                _note_ts(ts)
                 if sym not in _OPENED_CONTRACTS:
                     ts_str = str(ts)[11:19] if ts else datetime.datetime.now().strftime('%H:%M:%S')
                     _OPENED_CONTRACTS[sym] = {'first_tick': ts_str}
@@ -1195,6 +1321,7 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
         if ft:
             lp = ft.last_price or (getattr(ft, "pre_close", 0) or 0)
             ft_dt = getattr(ft, "datetime", None)
+            _note_ts(ft_dt)   # 期货 tick 同样可作服务器时间源
         sym = pos.vt_symbol.split('.')[0]
         if not lp:
             # 未开盘期货腿（IF/IC 无夜盘 tick）→ 与期权腿同一份 T-1 收盘切片兜底。
@@ -1222,8 +1349,49 @@ def _poll_once(engine: VNPYEngine, settlement_data: dict, settlement_prices: dic
             "datetime":         ft_dt,
         }
 
+    # ── 服务器时间偏移矫正（每轮一次）────────────────────────────────────────
+    # 本轮所有 tick 都已取过，这里只做一次算术。异常必须打出来：静默降级会让人
+    # 以为在用服务器时间，其实一直在用本机时间（曾整段被 except 吞掉）。
+    try:
+        if _shared_state["ctp_status"] != "connected":
+            _drop_time_offset()
+        else:
+            _sync_time_offset(_latest_ts[0])
+        cur = _TIME_OFFSET.total_seconds() if _TIME_OFFSET is not None else None
+        if cur != _LAST_LOGGED_OFFSET:   # 只在变化时打，正常态同秒不刷屏
+            logger.info(f"[time] 服务器偏移 {cur:+.1f}s" if cur is not None
+                        else "[time] 无服务器时间，降级本机")
+            _LAST_LOGGED_OFFSET = cur
+    except Exception as e:
+        _drop_time_offset()
+        logger.warning(f"[time] 偏移采集失败，降级本机时间: {type(e).__name__}: {e}")
+
+    # ── 对侧腿行情（深度实值 PCP 用）────────────────────────────────────────
+    # 只读 _COUNTER_GROUP 缓存，不在这里订阅（订阅在主循环 _poll_once 之后）。
+    # tick 为 None 说明还没订上 → 本轮 PCP 走 otm=None 退路，下轮有了再用。
+    counter_ticks: dict = {}
+    for (und_, exp_), vts in (_COUNTER_GROUP or {}).items():
+        lst = []
+        for vt in vts:
+            # 纯读缓存，绝不用 query_tick：未订阅时它会 sleep(0.2)，占交易轮询时延。
+            # 取不到 → 本轮 PCP 走 otm=None 退路，下轮订阅完成后自然就有了。
+            t = engine.main_engine.get_tick(vt)
+            if t is None:
+                continue
+            lst.append({
+                "last_price":  getattr(t, "last_price", 0) or 0,
+                "bid_price_1": getattr(t, "bid_price_1", 0) or 0,
+                "ask_price_1": getattr(t, "ask_price_1", 0) or 0,
+                "strike":      vt.rsplit("-", 1)[-1].split(".")[0],   # 供 _adjust_itm 匹配行权价
+                "cp":          1 if "C" in vt.rsplit("-", 1)[-1].split(".")[0][:1] else -1,
+                "datetime":    getattr(t, "datetime", None),
+            })
+        if lst:
+            counter_ticks[(und_, exp_)] = lst
+
     # 调用 price_options_batch（纯函数，无 engine 依赖）
-    option_greeks = price_options_batch(option_symbols, option_ticks, settlement_data)
+    option_greeks = price_options_batch(option_symbols, option_ticks, settlement_data,
+                                        counter_ticks=counter_ticks)
 
     # 回填 IV / adjust_price 到 option_ticks：positions_out 与 build_tree 都从这里取；
     # 否则 iv=None 传入 black76 会 TypeError，并导致整个 tree 构造抛异常 → 看板全空
@@ -1548,7 +1716,7 @@ def _current_session(dt: datetime.datetime = None):
     N 排最前（名称 N0 字典序 < A/P）。
     """
     if dt is None:
-        dt = datetime.datetime.now()
+        dt = _now()
     h = dt.hour + dt.minute / 60.0
 
     # 窗口右端各放宽 6min：收盘（11:30/15:00/02:30）之后仍留一次落盘机会，以取到收盘截面
@@ -1662,7 +1830,7 @@ def _load_yesterday_snapshot() -> dict:
     不跨业务日回退、不读历史 data_snapshot_*（盘中价/末价冒充昨收即为错误基准）。
     无 T-1 快照 → 返回 {} → calc_pnl 降级昨结算价 → 再 None。
     """
-    bd = _business_date(datetime.datetime.now())
+    bd = _business_date(_now())
     if _BASE_CACHE["bd"] == bd:
         return _BASE_CACHE["result"]
 
@@ -1705,7 +1873,7 @@ def _close_snapshot_step():
     if snap["ctp_status"] != "connected":
         return
 
-    now = datetime.datetime.now()
+    now = _now()
     t = now.time()
     bd = _business_date(now)
     if bd != _SAMPLE_BD:

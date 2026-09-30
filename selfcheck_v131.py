@@ -486,4 +486,80 @@ check("_live 不再清零 aware 行情（曾返回全 0）",
                "datetime": _aware})[0] == 185.6)
 
 
+# ── 回归：服务器时间偏移（业务时间以 CTP 为准，离线降级本机）──
+A._TIME_OFFSET = None
+check("无偏移时 _now() 降级本机时间", abs((A._now() - _now).total_seconds()) < 1)
+
+# 造一个「本机慢 90 秒」的场景：tick 时间戳比本机快 90s → 偏移应为 +90s
+_lag = datetime.timedelta(seconds=90)
+A._sync_time_offset((_now + _lag).replace(tzinfo=CHINA_TZ))
+check("_sync_time_offset 从 tick 反推正偏移（服务器快）", A._TIME_OFFSET is not None)
+check("_now() 加上偏移后逼近服务器时间",
+      abs((A._now() - (_now + _lag)).total_seconds()) < 2)
+
+# 陈旧 tick（超 30s）必须丢弃偏移 → 降级本机
+A._sync_time_offset((_now - datetime.timedelta(seconds=120)).replace(tzinfo=CHINA_TZ))
+check("_sync_time_offset 丢弃陈旧 tick 的偏移（降级本机）", A._TIME_OFFSET is None)
+
+# CTP 断开 → 偏移立即丢弃
+A._sync_time_offset((_now + _lag).replace(tzinfo=CHINA_TZ))
+A._drop_time_offset()
+check("_drop_time_offset 在 CTP 断开时清空偏移", A._TIME_OFFSET is None)
+A._TIME_OFFSET = None
+
+# max() 的 key 曾用 aware/naive 混比 → TypeError → 整段被 except 吞掉，偏移恒 None
+# 复现同一 key 逻辑，混合输入必须能排序且取到最新的那个
+def _naive_key(d):
+    if not d:
+        return datetime.datetime.min
+    return d.replace(tzinfo=None) if d.tzinfo else d
+
+_mixed = [_now, (_now + _lag).replace(tzinfo=CHINA_TZ)]
+try:
+    _latest_mixed = max(_mixed, default=None, key=_naive_key)
+    # max 返回原对象（带 tzinfo），比较前统一去 tzinfo，否则相减抛 TypeError
+    _mixed_ok = abs((_latest_mixed.replace(tzinfo=None) - (_now + _lag)).total_seconds()) < 5
+except TypeError:
+    _mixed_ok = False
+check("naive/aware 混合 tick 取 max 不抛 TypeError（曾致偏移静默恒 None）", _mixed_ok)
+
+
+# ── 深度实值 PCP 闸门（|Δ| > 0.6 才借对侧腿）────────────────────────────
+_NOW = datetime.datetime.now()
+_S, _K, _TTM, _IV = 1451.0, 1500.0, 77 / 365.0, 0.30
+
+
+def _mk(cp, k, last, bid, ask, dt=None):
+    return {"last_price": last, "bid_price_1": bid, "ask_price_1": ask,
+            "datetime": dt or _NOW, "strike": k, "cp": cp, "ttm": _TTM}
+
+
+# atm 附近 put（S=1498 vs K=1500）：|Δ| 小 → 不借对侧腿
+_atm_delta = P._delta_at(_IV, 1498.0, 1500.0, -1, _TTM)
+_counter = [_mk(1, 1500.0, 3.0, 2.9, 3.2)]
+_atm_leg = _mk(-1, 1500.0, 3.0, 2.9, 3.2)
+_v, _basis = P.calc_adjust_price_4level(_atm_leg, 1498.0, 1500.0, -1, [],
+                                          counter_legs=_counter, ref_iv=_IV)
+check("|Δ| 闸门：atm 附近不借对侧腿（|Δ|=%.3f ≤ 0.6）" % _atm_delta,
+      _atm_delta <= P._ITM_DELTA_GATE and _basis != "pcp",
+      f"basis={_basis}")
+
+# 深实值 put（S=1300 vs K=1500）：|Δ| > 0.6 → 借对侧腿做 PCP
+_deep_delta = P._delta_at(_IV, 1300.0, 1500.0, -1, _TTM)
+_deep_leg = _mk(-1, 1500.0, 205.0, 200.0, 215.0)
+_v2, _basis2 = P.calc_adjust_price_4level(_deep_leg, 1300.0, 1500.0, -1, [],
+                                           counter_legs=_counter, ref_iv=_IV)
+check("|Δ| 闸门：深实值借对侧腿走 PCP（|Δ|=%.3f > 0.6）" % _deep_delta,
+      _deep_delta > P._ITM_DELTA_GATE and _basis2.startswith("pcp"),
+      f"basis={_basis2}")
+
+# 无对侧腿 → 退回原兜底，不报错
+_v3, _basis3 = P.calc_adjust_price_4level(_deep_leg, 1300.0, 1500.0, -1, [],
+                                           counter_legs=None, ref_iv=_IV)
+check("无对侧腿时深实值退回原兜底（不抛异常）", _v3 > 0, f"v={_v3:.2f} basis={_basis3}")
+
+# 兜底吸近侧未回归
+check("PCP 超盘口仍吸近侧（兜底未回归）", _basis2.startswith("pcp"))
+
+
 print(f"\nPASS {ok} 项")

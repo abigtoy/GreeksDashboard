@@ -116,6 +116,7 @@ _STALE_MINUTES = 3               # 行情超过此分钟数视为过期
 _R_PARAM = 0.02                  # 统一无风险利率
 _REF_IV_MIN, _REF_IV_MAX = 0.05, 2.0   # 参考 IV 合理区间（反推结果过滤）
 _REF_IV_DEFAULT = 0.20           # 参考 IV 缺失时的默认值
+_ITM_DELTA_GATE = 0.6            # 深实值闸门：|Δ| > 0.6 才借对侧腿做 PCP（atm 附近不借，防摆动）
 
 def _pick_ref_iv(legs, F, r=_R_PARAM):
     """
@@ -223,14 +224,30 @@ def _adjust_otm(leg, s, ref_iv=None):
     # 价差过宽：旧版退中间价，改为参考 IV 模型价夹进盘口
     return _model_in_bracket(leg, s, ref_iv, b, a)
 
-def _adjust_itm(leg, s, k, cp, all_legs, ref_iv=None):
-    """阶梯3：深度实值 PCP 平价。OTM 腿价格嵌套 _adjust_otm。缺对手腿 → 参考 IV 模型价。"""
+def _delta_at(iv, s, k, cp, ttm):
+    """给定 IV 下的 delta 绝对值。用于「够不够深」的判定（|Δ|>0.6 才借对侧腿）。"""
+    if not iv or s <= 0 or k <= 0:
+        return 0.0
+    d = black76(iv, s, k, ttm, _R_PARAM, cp)["delta"]
+    return abs(d) if d == d else 0.0
+
+
+def _adjust_itm(leg, s, k, cp, all_legs, ref_iv=None, counter_legs=None):
+    """阶梯3：深度实值 PCP 平价。OTM 腿价格嵌套 _adjust_otm。缺对手腿 → 参考 IV 模型价。
+
+    闸门：|Δ| ≤ _ITM_DELTA_GATE（atm 附近）不借对侧腿 —— 自身流动性本就够，
+    查询对侧只会引入摆动。深实值才需要 PCP 补强。
+    counter_legs：api_server 单独订阅的同 K 对侧腿行情（不并入共用腿池）。
+    """
     _, b, a = _live(leg)
     b, a = _bracket(b, a)
-    otm = next((t for t in all_legs
+    ttm = leg.get('ttm') or 0.0
+    pool = list(counter_legs or []) + list(all_legs or [])
+    otm = next((t for t in pool
                 if t.get('cp') == -cp and abs((t.get('strike') or 0) - k) < 0.01), None)
-    if otm is None:
-        return _model_in_bracket(leg, s, ref_iv, b, a)
+    # 闸门：atm 附近（|Δ| 小）→ 不查对侧腿，走 OTM 同款逻辑
+    if otm is None or _delta_at(ref_iv or _REF_IV_DEFAULT, s, k, cp, ttm) <= _ITM_DELTA_GATE:
+        return _adjust_otm(leg, s, ref_iv)
     otm_k = otm.get('strike') or k
     otm_p, _ = _adjust_otm(otm, s, ref_iv)
     otm_tv = max(otm_p - _intrinsic(s, otm_k, otm.get('cp')), 0.0)
@@ -243,10 +260,11 @@ def _adjust_itm(leg, s, k, cp, all_legs, ref_iv=None):
         return a, 'pcp_ask'
     return adj, 'pcp'
 
-def calc_adjust_price_4level(leg, s, k, cp, all_legs, pre_close=0.0, ref_iv=None):
+def calc_adjust_price_4level(leg, s, k, cp, all_legs, pre_close=0.0, ref_iv=None,
+                             counter_legs=None):
     """调整价入口（§3.2 阶梯）+ 兜底 last → pre_close → 0。返回 (价, basis)。"""
     is_itm = (cp == 1 and s > k) or (cp == -1 and s < k)
-    adj, basis = (_adjust_itm(leg, s, k, cp, all_legs, ref_iv) if is_itm
+    adj, basis = (_adjust_itm(leg, s, k, cp, all_legs, ref_iv, counter_legs) if is_itm
                   else _adjust_otm(leg, s, ref_iv))
     if adj and adj > 0:
         return adj, basis
@@ -284,7 +302,8 @@ def calc_greeks_from_market(market_price: float,
 # 批量 Greeks 计算（纯函数，无 CTP 依赖）
 # option_ticks 中可选携带 'underlying_price' 字段（Worker 预填）
 # -----------------------------------------------------------------------
-def price_options_batch(symbols, option_ticks, settlement_data, ref_legs=None):
+def price_options_batch(symbols, option_ticks, settlement_data, ref_legs=None,
+                        counter_ticks=None):
     """
     批量计算期权 Greeks，纯函数，不依赖任何 CTP / vnpy 对象。
 
@@ -301,7 +320,14 @@ def price_options_batch(symbols, option_ticks, settlement_data, ref_legs=None):
         settlement_data: {symbol: {avg_buy_price, avg_sell_price, ...}}
                          或直接 {f"{sym}_多": float, f"{sym}_空": float}（兼容）
         ref_legs:        可选，{(und, expiry): [{strike, cp, last_price, ttm}]}
-                         参考 IV 的腿池（可含未持仓的平值腿）；缺省用持仓腿
+                         **仅供参考 IV 提炼**（_pick_ref_iv 要的是近平值腿：
+                         K<F 最大 put / K>F 最小 call 的中位数）。缺省用持仓腿。
+                         ⚠️ 当前 api_server 从未传此参数 → 一直退持仓腿。
+                         注意：它与 counter_ticks 语义不同，别混用
+                         （PCP 要的是同 K 对侧腿，不是近平值腿）。
+        counter_ticks:   可选，{(und, expiry): [{strike, cp, last_price, ttm, ...}]}
+                         同 K 对侧腿（反向 C/P）行情，供深度实值 PCP 平价（§3.2.1）。
+                         **只服务 PCP**，不并入 legs_by_group，避免污染共用腿池与参考 IV 提炼。
 
     返回:
         {vt_symbol: {iv, delta, gamma, theta, vega, open_price, adjust_price,
@@ -328,6 +354,14 @@ def price_options_batch(symbols, option_ticks, settlement_data, ref_legs=None):
         lg['cp'] = 1 if nm_.rfind('C') > nm_.rfind('P') else -1
         lg['ttm'] = max(days_to_expiry(exp_) / 365.0, 0.5 / 365.0)
         legs_by_group[(und_, exp_)].append(lg)
+
+    # 对侧腿池（独立）：api_server 单独订阅的同 K 对侧合约行情，只喂 PCP
+    counter_by_group = defaultdict(list)
+    for (und_, exp_), lst in (counter_ticks or {}).items():
+        for lg in lst:
+            g = dict(lg)
+            g.setdefault('ttm', max(days_to_expiry(exp_) / 365.0, 0.5 / 365.0))
+            counter_by_group[(und_, exp_)].append(g)
 
     ref_iv_map = {}  # (und, expiry) -> 参考 IV（小数）或 None
     for (und, expiry) in by_underlying:
@@ -384,6 +418,7 @@ def price_options_batch(symbols, option_ticks, settlement_data, ref_legs=None):
                 legs_by_group.get((und, expiry_dt), []),
                 pre_close=contract.get('pre_close') or 0,
                 ref_iv=ref_iv,
+                counter_legs=counter_by_group.get((und, expiry_dt), []),
             )
 
             # IV：价来自市场证据时反推；反推无解/出界/只有昨收 → 退参考 IV → 默认 20%
